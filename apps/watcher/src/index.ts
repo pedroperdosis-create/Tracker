@@ -1,6 +1,7 @@
 import "dotenv/config";
 import pino from "pino";
 import { Telegraf } from "telegraf";
+import http from "node:http";
 import { Address } from "@ton/core";
 import WebSocket, { type RawData } from "ws";
 import {
@@ -57,6 +58,12 @@ const tonapiLimiter = new TonApiLimiter({
 const WS_MODE = process.env.WS_MODE === "1";
 const TONCENTER_WS_URL = process.env.TONCENTER_WS_URL;
 const TONCENTER_API_KEY = process.env.TONCENTER_API_KEY;
+const WEBHOOK_PORT = Number(process.env.WEBHOOK_PORT ?? 8080);
+const TONAPI_WEBHOOK_TOKEN = process.env.TONAPI_WEBHOOK_TOKEN;
+const TONAPI_WEBHOOK_ENDPOINT = process.env.TONAPI_WEBHOOK_ENDPOINT;
+const TONAPI_WEBHOOK_ID = process.env.TONAPI_WEBHOOK_ID;
+const WEBHOOK_MODE = Boolean(TONAPI_WEBHOOK_TOKEN && TONAPI_WEBHOOK_ENDPOINT);
+const FAST_POLLING_ENABLED = FAST_MODE && !WEBHOOK_MODE;
 
 const walletSchedule = new Map<string, { nextPollAt: number; backoffMs: number }>();
 let lastScheduleLogAt = 0;
@@ -349,6 +356,211 @@ async function fetchEvents(address: string, lastLt?: string): Promise<TonApiEven
   return data.events ?? [];
 }
 
+const processEventsForWallet = async (
+  wallet: ProcessWalletInput,
+  events: TonApiEvent[],
+  user: { telegramId: string },
+  lang: Language,
+  source: "polling" | "webhook" | "ws"
+): Promise<ProcessWalletResult> => {
+  const walletRaw = Address.parse(wallet.address).toRawString();
+  const actionsCount = events.reduce((sum, event) => sum + (event.actions?.length ?? 0), 0);
+  const sampleEvent = events[0];
+  const sampleLt = sampleEvent ? extractEventLt(sampleEvent) : null;
+  const maxFetchedLt = events.reduce((max, event) => {
+    const lt = extractEventLt(event);
+    if (!lt) return max;
+    const value = BigInt(lt);
+    return value > max ? value : max;
+  }, 0n);
+  logger.info(
+    {
+      walletId: wallet.id,
+      address: wallet.address,
+      events: events.length,
+      actions: actionsCount,
+      sample: sampleEvent ? { txHash: sampleEvent.event_id, lt: sampleLt } : null,
+      maxFetchedLt: maxFetchedLt ? maxFetchedLt.toString() : null,
+      source
+    },
+    "tonapi events fetched"
+  );
+
+  if (events.length === 0) return createEmptyProcessResult();
+
+  const cursorBefore = wallet.lastEventLt ? BigInt(wallet.lastEventLt) : null;
+  const sorted = events.sort((a, b) => {
+    const aLt = extractEventLt(a);
+    const bLt = extractEventLt(b);
+    if (!aLt || !bLt) return 0;
+    return Number(BigInt(aLt) - BigInt(bLt));
+  });
+  let maxLt = cursorBefore ?? 0n;
+  let newCount = 0;
+  let normalizedCountTotal = 0;
+  let insertedCount = 0;
+  let insertErrorsCount = 0;
+  let notifiedCount = 0;
+
+  for (const event of sorted) {
+    const eventLtRaw = extractEventLt(event);
+    if (!eventLtRaw) {
+      logger.warn({ txHash: event.event_id }, "missing or invalid lt in event");
+      continue;
+    }
+    const eventLt = BigInt(eventLtRaw);
+    if (cursorBefore !== null && eventLt <= cursorBefore) {
+      continue;
+    }
+    newCount += 1;
+    const actionTypes = event.actions.map((action) => action.type);
+    const tonTxHash = event.base_transactions?.[0] ?? event.event_id;
+    const actionEntries = event.actions.map((action, index) => ({ action, index }));
+    const swapSummary = buildSwapSummary(actionEntries, walletRaw);
+    const hasJettonTransferForWallet = actionEntries.some(({ action }) => {
+      if (action.type !== "JettonTransfer") return false;
+      const transfer = getJettonTransfer(action);
+      if (!transfer) return false;
+      if (action.status && action.status !== "ok") return false;
+      const sender = transfer.sender?.address;
+      const recipient = transfer.recipient?.address;
+      return sender === walletRaw || recipient === walletRaw;
+    });
+    const entriesForNormalization = hasJettonTransferForWallet
+      ? actionEntries.filter(({ action }) => action.type === "JettonTransfer")
+      : actionEntries;
+    const normalized = normalizeActions(entriesForNormalization, wallet.address, walletRaw, event.event_id);
+    normalizedCountTotal += normalized.length;
+    logger.info(
+      { txHash: event.event_id, lt: eventLtRaw, actionTypes, normalizedCount: normalized.length },
+      "processing event"
+    );
+    if (normalized.length === 0) {
+      logger.warn(
+        { txHash: event.event_id, lt: eventLtRaw, actionTypes },
+        "no normalized actions for event"
+      );
+      maxLt = eventLt > maxLt ? eventLt : maxLt;
+      continue;
+    }
+    const createdActions: NormalizedAction[] = [];
+    for (const action of normalized) {
+      const txHash = action.type === "JETTON" ? event.event_id : tonTxHash;
+      try {
+        await prisma.walletEvent.create({
+          data: {
+            walletId: wallet.id,
+            txHash,
+            actionId: action.actionId,
+            type: action.type,
+            direction: action.direction,
+            asset: action.asset,
+            amount: action.amount ?? null,
+            counterparty: action.counterparty?.address ?? action.counterparty?.name ?? null,
+            metadata: {
+              action,
+              event: { id: event.event_id, lt: eventLtRaw, txHash },
+              jetton:
+                action.type === "JETTON"
+                  ? {
+                      symbol: action.asset,
+                      decimals:
+                        getJettonTransfer((action.raw ?? {}) as TonApiAction)?.jetton?.decimals ??
+                        null,
+                      rawAmount:
+                        getJettonTransfer((action.raw ?? {}) as TonApiAction)?.amount ?? null,
+                      address:
+                        getJettonTransfer((action.raw ?? {}) as TonApiAction)?.jetton?.address ??
+                        null,
+                      originalAction: action.raw ?? null
+                    }
+                  : null
+            }
+          }
+        });
+        createdActions.push(action);
+        insertedCount += 1;
+        if (action.type === "JETTON") {
+          const transfer = getJettonTransfer((action.raw ?? {}) as TonApiAction);
+          logger.info(
+            {
+              walletId: wallet.id,
+              txHash,
+              symbol: action.asset,
+              direction: action.direction,
+              humanAmount: action.amount ?? "0",
+              rawAmount: transfer?.amount ?? null,
+              decimals: transfer?.jetton?.decimals ?? null
+            },
+            "Jetton processed"
+          );
+        }
+      } catch (error) {
+        if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
+          continue;
+        }
+        insertErrorsCount += 1;
+        logger.error(
+          {
+            error,
+            txHash: event.event_id,
+            actionId: action.actionId,
+            type: action.type,
+            stack: error instanceof Error ? error.stack?.split("\n").slice(0, 3).join("\n") : undefined
+          },
+          "failed to insert wallet event"
+        );
+        throw error;
+      }
+    }
+
+    if (createdActions.length > 0) {
+      const messageTxHash = createdActions.every((action) => action.type === "JETTON") ? event.event_id : tonTxHash;
+      const message = swapSummary
+        ? formatSwapMessage(wallet.name, wallet.address, messageTxHash, swapSummary, lang)
+        : formatMessage(wallet.name, wallet.address, messageTxHash, createdActions, lang);
+      try {
+        await bot.telegram.sendMessage(Number(user.telegramId), message, {
+          parse_mode: "HTML",
+          disable_web_page_preview: true
+        });
+        logger.info(
+          { chatId: Number(user.telegramId), walletId: wallet.id, txHash: messageTxHash },
+          "notification sent"
+        );
+        notifiedCount += 1;
+      } catch (error) {
+        logger.warn(
+          { error, chatId: Number(user.telegramId), walletId: wallet.id, txHash: messageTxHash },
+          "notification failed"
+        );
+      }
+    }
+
+    maxLt = eventLt > maxLt ? eventLt : maxLt;
+  }
+
+  logger.info(
+    {
+      walletId: wallet.id,
+      cursorBefore: cursorBefore?.toString() ?? null,
+      maxFetchedLt: maxFetchedLt ? maxFetchedLt.toString() : null,
+      newCount,
+      normalizedCountTotal,
+      insertedCount,
+      insertErrorsCount,
+      notifiedCount,
+      cursorAfter: maxLt.toString()
+    },
+    "wallet processing summary"
+  );
+
+  if (cursorBefore === null ? newCount > 0 : normalizedCountTotal > 0 && insertedCount > 0) {
+    await prisma.wallet.update({ where: { id: wallet.id }, data: { lastEventLt: maxLt.toString() } });
+  }
+  return { newCount, notifiedCount };
+};
+
 async function processWallet(wallet: ProcessWalletInput): Promise<ProcessWalletResult> {
   const user = await prisma.user.findUnique({ where: { id: wallet.userId } });
   if (!user) return { newCount: 0, notifiedCount: 0 };
@@ -619,6 +831,199 @@ const buildWsUrl = () => {
   }
 };
 
+type WebhookPayload = {
+  account_id?: string;
+  lt?: string;
+  tx_hash?: string;
+};
+
+type WebhookQueueItem = {
+  payload: WebhookPayload;
+  receivedAt: number;
+};
+
+const createWebhookQueue = (handler: (item: WebhookQueueItem) => Promise<void>) => {
+  const inFlight = new Set<string>();
+  const pending = new Map<string, WebhookQueueItem>();
+
+  const run = (key: string) => {
+    if (inFlight.has(key)) return;
+    const item = pending.get(key);
+    if (!item) return;
+    pending.delete(key);
+    inFlight.add(key);
+    void handler(item)
+      .catch((error) => logger.warn({ error, key }, "webhook processing failed"))
+      .finally(() => {
+        inFlight.delete(key);
+        if (pending.has(key)) {
+          run(key);
+        }
+      });
+  };
+
+  return {
+    enqueue: (payload: WebhookPayload) => {
+      const key = payload.tx_hash ?? `${payload.account_id ?? "unknown"}:${payload.lt ?? "unknown"}`;
+      pending.set(key, { payload, receivedAt: Date.now() });
+      run(key);
+    }
+  };
+};
+
+const resolveWalletLookup = async (wallets: WsWallet[]) => {
+  const entries: Array<[string, WsWallet]> = [];
+  for (const wallet of wallets) {
+    try {
+      const raw = Address.parse(wallet.address).toRawString();
+      entries.push([wallet.address, wallet], [raw, wallet]);
+    } catch {
+      entries.push([wallet.address, wallet]);
+    }
+  }
+  return new Map(entries);
+};
+
+const fetchWebhookEvents = async (accountId: string, lt?: string, txHash?: string) => {
+  const events = await fetchEvents(accountId, lt);
+  if (!txHash) return events;
+  return events.filter(
+    (event) => event.event_id === txHash || event.base_transactions?.includes(txHash)
+  );
+};
+
+const startWebhookServer = (queue: ReturnType<typeof createWebhookQueue>) => {
+  const server = http.createServer((req, res) => {
+    if (req.method !== "POST" || req.url !== "/tonapi/webhook") {
+      res.statusCode = 404;
+      res.end();
+      return;
+    }
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk.toString();
+    });
+    req.on("end", () => {
+      res.statusCode = 200;
+      res.end("ok");
+      try {
+        const payload = JSON.parse(body) as WebhookPayload;
+        logger.info(
+          { accountId: payload.account_id ?? null, lt: payload.lt ?? null, txHash: payload.tx_hash ?? null },
+          "webhook received"
+        );
+        queue.enqueue(payload);
+      } catch (error) {
+        logger.warn({ error }, "webhook parse failed");
+      }
+    });
+  });
+  server.listen(WEBHOOK_PORT, () => {
+    logger.info({ port: WEBHOOK_PORT }, "webhook server listening");
+  });
+};
+
+const subscribeWebhookAccounts = async (webhookId: string, accounts: string[]) => {
+  if (!TONAPI_WEBHOOK_TOKEN) return;
+  const headers = {
+    Authorization: `Bearer ${TONAPI_WEBHOOK_TOKEN}`,
+    "Content-Type": "application/json"
+  };
+  const variants = [
+    { name: "account-tx", path: `/webhooks/${webhookId}/account-tx/subscribe`, key: "accounts" },
+    { name: "account-tx-ids", path: `/webhooks/${webhookId}/account-tx/subscribe`, key: "account_ids" },
+    { name: "accounts", path: `/webhooks/${webhookId}/accounts`, key: "accounts" }
+  ];
+  const batchSize = 50;
+  let subscribed = 0;
+  let failed = 0;
+  for (let i = 0; i < accounts.length; i += batchSize) {
+    const batch = accounts.slice(i, i + batchSize);
+    for (const variant of variants) {
+      try {
+        const response = await fetch(`https://rt.tonapi.io${variant.path}`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ [variant.key]: batch })
+        });
+        if (response.ok) {
+          subscribed += batch.length;
+          logger.info({ count: batch.length, variant: variant.name }, "webhook accounts subscribed");
+          break;
+        }
+        if (response.status === 409) {
+          logger.info({ count: batch.length, variant: variant.name }, "webhook accounts already subscribed");
+          subscribed += batch.length;
+          break;
+        }
+        const body = await response.text();
+        logger.warn(
+          { status: response.status, body: body.slice(0, 200), variant: variant.name },
+          "webhook subscribe failed"
+        );
+        failed += batch.length;
+      } catch (error) {
+        logger.warn({ error, variant: variant.name }, "webhook subscribe error");
+        failed += batch.length;
+      }
+    }
+  }
+  logger.info({ subscribed, failed }, "webhook subscribe summary");
+};
+
+const ensureWebhookId = async () => {
+  if (!TONAPI_WEBHOOK_TOKEN || !TONAPI_WEBHOOK_ENDPOINT) return null;
+  if (TONAPI_WEBHOOK_ID) return TONAPI_WEBHOOK_ID;
+  try {
+    const response = await fetch("https://rt.tonapi.io/webhooks", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${TONAPI_WEBHOOK_TOKEN}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ endpoint: TONAPI_WEBHOOK_ENDPOINT })
+    });
+    const payload = (await response.json()) as { webhook_id?: string; id?: string };
+    const webhookId = payload.webhook_id ?? payload.id ?? null;
+    if (webhookId) {
+      logger.info({ webhookId }, "webhook created; set TONAPI_WEBHOOK_ID in env");
+    } else {
+      logger.warn({ payload }, "webhook created but id missing");
+    }
+    return webhookId;
+  } catch (error) {
+    logger.warn({ error }, "webhook create failed");
+    return null;
+  }
+};
+
+let cachedWalletLookup = new Map<string, WsWallet>();
+let walletLookupUpdatedAt = 0;
+
+const refreshWalletLookup = async () => {
+  const now = Date.now();
+  if (now - walletLookupUpdatedAt < 30_000 && cachedWalletLookup.size > 0) {
+    return Array.from(new Map(cachedWalletLookup.values().map((wallet) => [wallet.id, wallet])).values());
+  }
+  const wallets = await prisma.wallet.findMany();
+  cachedWalletLookup = await resolveWalletLookup(wallets);
+  walletLookupUpdatedAt = now;
+  return wallets;
+};
+
+const getWalletFromLookup = async (accountId: string) => {
+  await refreshWalletLookup();
+  let wallet = cachedWalletLookup.get(accountId);
+  if (!wallet) {
+    try {
+      wallet = cachedWalletLookup.get(Address.parse(accountId).toRawString());
+    } catch {
+      wallet = undefined;
+    }
+  }
+  return wallet;
+};
+
 const startWebSocket = (
   walletsProvider: () => Promise<WsWallet[]>,
   walletLookup: () => Map<string, WsWallet>
@@ -779,7 +1184,8 @@ async function poll() {
         scheduleBackoff(wallet.id, now, result.errorStatus);
         continue;
       }
-      const intervalMs = result.newCount > 0 ? FAST_POLL_INTERVAL_MS : BASE_POLL_INTERVAL_MS;
+      const intervalMs =
+        result.newCount > 0 && FAST_POLLING_ENABLED ? FAST_POLL_INTERVAL_MS : BASE_POLL_INTERVAL_MS;
       scheduleNext(wallet.id, now, intervalMs);
     }
     await sleep(200 + jitter());
@@ -789,27 +1195,79 @@ async function poll() {
 
 async function start() {
   logger.info(
-    { wsMode: WS_MODE, toncenterWsConfigured: Boolean(TONCENTER_WS_URL) },
+    {
+      wsMode: WS_MODE,
+      toncenterWsConfigured: Boolean(TONCENTER_WS_URL),
+      webhooksConfigured: WEBHOOK_MODE,
+      webhookId: TONAPI_WEBHOOK_ID ?? null
+    },
     "watcher started"
   );
   let backoffMs = 0;
   let nextInterval = BASE_POLL_INTERVAL_MS;
-  let wsWalletLookup = new Map<string, WsWallet>();
+  const webhookQueue = createWebhookQueue(async ({ payload, receivedAt }) => {
+    const accountId = payload.account_id;
+    if (!accountId) {
+      logger.warn({ payload }, "webhook payload missing account_id");
+      return;
+    }
+    const wallet = await getWalletFromLookup(accountId);
+    if (!wallet) {
+      logger.warn({ accountId }, "webhook wallet not tracked");
+      return;
+    }
+    const user = await prisma.user.findUnique({ where: { id: wallet.userId } });
+    if (!user) return;
+    const lang = (user.language as Language) ?? DEFAULT_LANGUAGE;
+    let events: TonApiEvent[] = [];
+    try {
+      events = await fetchWebhookEvents(accountId, payload.lt, payload.tx_hash);
+    } catch (error) {
+      logger.warn({ error, accountId }, "webhook fetch failed");
+      return;
+    }
+    const result = await processEventsForWallet(wallet, events, user, lang, "webhook");
+    logger.info(
+      {
+        accountId,
+        txHash: payload.tx_hash ?? null,
+        lt: payload.lt ?? null,
+        durationMs: Date.now() - receivedAt,
+        newCount: result.newCount,
+        notifiedCount: result.notifiedCount
+      },
+      "webhook processed"
+    );
+  });
+
+  startWebhookServer(webhookQueue);
+
+  if (WEBHOOK_MODE) {
+    const webhookId = await ensureWebhookId();
+    if (!webhookId) {
+      logger.warn("webhooks configured but webhook id could not be resolved");
+    } else {
+      const wallets = await refreshWalletLookup();
+      const accountIds = wallets.flatMap((wallet) => {
+        try {
+          return [Address.parse(wallet.address).toRawString()];
+        } catch {
+          return [];
+        }
+      });
+      await subscribeWebhookAccounts(webhookId, accountIds);
+    }
+  } else if (TONAPI_WEBHOOK_TOKEN || TONAPI_WEBHOOK_ENDPOINT) {
+    logger.warn("webhooks partially configured; polling fallback active");
+  }
+
+  let wsWalletLookup = cachedWalletLookup;
   if (WS_MODE) {
     startWebSocket(
       async () => {
-        const wallets = await prisma.wallet.findMany();
-        const wsWallets: ProcessWalletInput[] = wallets;
-        wsWalletLookup = new Map(
-          wsWallets.flatMap((wallet) => {
-            const raw = Address.parse(wallet.address).toRawString();
-            return [
-              [wallet.address, wallet],
-              [raw, wallet]
-            ] as Array<[string, WsWallet]>;
-          })
-        );
-        return Array.from(wsWalletLookup.values());
+        await refreshWalletLookup();
+        wsWalletLookup = cachedWalletLookup;
+        return Array.from(new Map(cachedWalletLookup.values().map((wallet) => [wallet.id, wallet])).values());
       },
       () => wsWalletLookup
     );
@@ -819,7 +1277,7 @@ async function start() {
     try {
       const result = await poll();
       if (result) {
-        nextInterval = result.newEvents > 0 ? FAST_POLL_INTERVAL_MS : BASE_POLL_INTERVAL_MS;
+        nextInterval = result.newEvents > 0 && FAST_POLLING_ENABLED ? FAST_POLL_INTERVAL_MS : BASE_POLL_INTERVAL_MS;
       }
       backoffMs = 0;
     } catch (error) {

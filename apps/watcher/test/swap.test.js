@@ -36,8 +36,8 @@ test("SwapSummary: jetton OUT + TON IN => swap", () => {
   assert.ok(summary);
   assert.equal(summary.tokenSold?.asset, "TEST");
   assert.equal(summary.tokenSold?.amount, "1");
-  assert.equal(summary.quote?.asset, "TON");
-  assert.equal(summary.quote?.amount, "2");
+  assert.equal(summary.tokenBought?.asset, "TON");
+  assert.equal(summary.tokenBought?.amount, "2");
 });
 
 test("Direction: internal transfer between tracked wallets", () => {
@@ -112,6 +112,111 @@ test("SwapSummary: jetton OUT + jetton IN (different assets) => swap", () => {
         status: "ok",
         JettonTransfer: {
           amount: "500000",
+          jetton: { symbol: "BBB", decimals: 6 },
+          sender: { address: "0:router" },
+          recipient: { address: walletRaw }
+        }
+      }
+    }
+  ];
+  const summary = buildSwapSummary(entries, walletRaw);
+  assert.ok(summary);
+  assert.equal(summary.tokenSold?.asset, "AAA");
+  assert.equal(summary.tokenBought?.asset, "BBB");
+});
+
+test("SwapSummary: TON OUT + jetton IN => swap", () => {
+  const walletRaw = "0:wallet";
+  const entries = [
+    {
+      index: 0,
+      action: {
+        type: "TonTransfer",
+        status: "ok",
+        TonTransfer: {
+          amount: "1500000000",
+          sender: { address: walletRaw },
+          recipient: { address: "0:router" }
+        }
+      }
+    },
+    {
+      index: 1,
+      action: {
+        type: "JettonTransfer",
+        status: "ok",
+        JettonTransfer: {
+          amount: "900000",
+          jetton: { symbol: "JET", decimals: 6 },
+          sender: { address: "0:router" },
+          recipient: { address: walletRaw }
+        }
+      }
+    }
+  ];
+  const summary = buildSwapSummary(entries, walletRaw);
+  assert.ok(summary);
+  assert.equal(summary.tokenSold?.asset, "TON");
+  assert.equal(summary.tokenSold?.amount, "1.5");
+  assert.equal(summary.tokenBought?.asset, "JET");
+  assert.equal(summary.tokenBought?.amount, "0.9");
+});
+
+test("SwapSummary: internal transfer is not swap", () => {
+  const walletRaw = "0:wallet";
+  const entries = [
+    {
+      index: 0,
+      action: {
+        type: "TonTransfer",
+        status: "ok",
+        TonTransfer: {
+          amount: "1000000000",
+          sender: { address: walletRaw },
+          recipient: { address: "0:other" }
+        }
+      }
+    }
+  ];
+  const summary = buildSwapSummary(entries, walletRaw);
+  assert.equal(summary, null);
+});
+
+test("SwapSummary: ignores small TON fee when jetton transfers present", () => {
+  const walletRaw = "0:wallet";
+  const entries = [
+    {
+      index: 0,
+      action: {
+        type: "TonTransfer",
+        status: "ok",
+        TonTransfer: {
+          amount: "1000000",
+          sender: { address: walletRaw },
+          recipient: { address: "0:router" }
+        }
+      }
+    },
+    {
+      index: 1,
+      action: {
+        type: "JettonTransfer",
+        status: "ok",
+        JettonTransfer: {
+          amount: "1000000",
+          jetton: { symbol: "AAA", decimals: 6 },
+          sender: { address: walletRaw },
+          recipient: { address: "0:router" }
+        }
+      }
+    },
+    {
+      index: 2,
+      action: {
+        type: "JettonTransfer",
+        status: "ok",
+        JettonTransfer: {
+          amount: "2000000",
           jetton: { symbol: "BBB", decimals: 6 },
           sender: { address: "0:router" },
           recipient: { address: walletRaw }

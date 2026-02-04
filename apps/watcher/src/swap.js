@@ -29,88 +29,126 @@ const toTon = (amount) => {
   return fracStr ? `${whole}.${fracStr}` : `${whole}`;
 };
 
+const shortAddress = (value) => {
+  if (!value) return "JETTON";
+  if (value.length <= 10) return value;
+  return `${value.slice(0, 4)}...${value.slice(-4)}`;
+};
+
 export const buildSwapSummary = (entries, trackedRawAddress) => {
-  const jettonEntries = entries.filter(({ action }) => action.type === "JettonTransfer" && getJettonTransfer(action));
-  const tonEntries = entries.filter(({ action }) => action.type === "TonTransfer" && getTonTransfer(action));
+  const incoming = new Map();
+  const outgoing = new Map();
+  let hasJetton = false;
 
-  if (jettonEntries.length === 0) {
-    return null;
-  }
+  const upsert = (map, entry) => {
+    const existing = map.get(entry.assetKey);
+    if (existing) {
+      existing.rawAmount += entry.rawAmount;
+      return;
+    }
+    map.set(entry.assetKey, { ...entry });
+  };
 
-  let tokenBought;
-  let tokenSold;
-  let netUsdJetton = null;
-
-  for (const { action } of jettonEntries) {
+  for (const { action } of entries) {
     if (action.status && action.status !== "ok") continue;
-    const transfer = getJettonTransfer(action);
-    if (!transfer) continue;
-    const sender = transfer.sender?.address;
-    const recipient = transfer.recipient?.address;
-    const direction = getDirection(trackedRawAddress, sender, recipient);
-    if (!direction) continue;
-    const decimals = transfer.jetton?.decimals;
-    const rawAmount = transfer.amount ? String(transfer.amount) : "0";
-    const amount = typeof decimals === "number" ? toJetton(rawAmount, decimals) : rawAmount;
-    const asset = transfer.jetton?.symbol ?? transfer.jetton?.address ?? "JETTON";
-    if (isUsdJetton(transfer.jetton?.symbol)) {
-      const delta = BigInt(rawAmount);
-      if (!netUsdJetton) {
-        netUsdJetton = { amount: 0n, symbol: transfer.jetton?.symbol };
+    if (action.type === "JettonTransfer") {
+      const transfer = getJettonTransfer(action);
+      if (!transfer) continue;
+      const sender = transfer.sender?.address;
+      const recipient = transfer.recipient?.address;
+      const direction = getDirection(trackedRawAddress, sender, recipient);
+      if (!direction) continue;
+      hasJetton = true;
+      const rawAmount = transfer.amount ? String(transfer.amount) : "0";
+      const assetKey = transfer.jetton?.address ?? transfer.jetton?.symbol ?? "JETTON";
+      const asset = transfer.jetton?.symbol ?? shortAddress(transfer.jetton?.address);
+      const entry = {
+        assetKey,
+        asset,
+        rawAmount: BigInt(rawAmount),
+        decimals: transfer.jetton?.decimals
+      };
+      if (direction === "IN") {
+        upsert(incoming, entry);
+      } else {
+        upsert(outgoing, entry);
       }
-      if (recipient === trackedRawAddress) {
-        netUsdJetton.amount += delta;
-      } else if (sender === trackedRawAddress) {
-        netUsdJetton.amount -= delta;
-      }
     }
-    if (direction === "IN" && !tokenBought) {
-      tokenBought = { asset, amount };
-    }
-    if (direction === "OUT" && !tokenSold) {
-      tokenSold = { asset, amount };
-    }
-  }
-
-  if (!tokenBought && !tokenSold) {
-    return null;
-  }
-
-  let quote;
-  if (tonEntries.length > 0) {
-    let netTon = 0n;
-    for (const { action } of tonEntries) {
+    if (action.type === "TonTransfer") {
       const transfer = getTonTransfer(action);
       if (!transfer) continue;
       const sender = transfer.sender?.address;
       const recipient = transfer.recipient?.address;
-      if (sender === trackedRawAddress) {
-        netTon -= BigInt(transfer.amount ?? "0");
-      } else if (recipient === trackedRawAddress) {
-        netTon += BigInt(transfer.amount ?? "0");
+      const direction = getDirection(trackedRawAddress, sender, recipient);
+      if (!direction) continue;
+      const entry = {
+        assetKey: "TON",
+        asset: "TON",
+        rawAmount: BigInt(transfer.amount ?? "0"),
+        decimals: 9
+      };
+      if (direction === "IN") {
+        upsert(incoming, entry);
+      } else {
+        upsert(outgoing, entry);
       }
     }
-    if (netTon !== 0n) {
-      quote = { asset: "TON", amount: toTon(netTon < 0n ? (-netTon).toString() : netTon.toString()) };
+  }
+
+  if (hasJetton) {
+    const tonOut = outgoing.get("TON");
+    if (tonOut && tonOut.rawAmount < 5_000_000n) {
+      outgoing.delete("TON");
     }
   }
 
-  if (!quote && netUsdJetton && netUsdJetton.amount !== 0n) {
-    const decimals = jettonEntries
-      .map(({ action }) => getJettonTransfer(action)?.jetton?.decimals)
-      .find((value) => typeof value === "number");
-    const rawAmount = netUsdJetton.amount < 0n ? (-netUsdJetton.amount).toString() : netUsdJetton.amount.toString();
-    const amount = typeof decimals === "number" ? toJetton(rawAmount, decimals) : rawAmount;
-    quote = { asset: netUsdJetton.symbol ?? "USD₮", amount };
-  }
-
-  const hasBothJettonSides = tokenBought && tokenSold && tokenBought.asset !== tokenSold.asset;
-  const hasJettonAndQuote = (tokenBought || tokenSold) && quote;
-  const isSameAssetQuote = quote && (tokenBought?.asset === quote.asset || tokenSold?.asset === quote.asset);
-
-  if (!hasBothJettonSides && (!hasJettonAndQuote || isSameAssetQuote)) {
+  if (incoming.size === 0 || outgoing.size === 0) {
     return null;
   }
 
-  return { tokenBought, tokenSold, quote };
+  const pickLargest = (values) => {
+    let best;
+    for (const value of values) {
+      if (!best || value.rawAmount > best.rawAmount) {
+        best = value;
+      }
+    }
+    return best;
+  };
+
+  const pickedIncoming = pickLargest(incoming.values());
+  const pickedOutgoing = pickLargest(outgoing.values());
+  if (!pickedIncoming || !pickedOutgoing) {
+    return null;
+  }
+
+  let tokenBought = pickedIncoming;
+  let tokenSold = pickedOutgoing;
+
+  if (tokenBought.assetKey === tokenSold.assetKey) {
+    const altIncoming = [...incoming.values()].find((value) => value.assetKey !== tokenSold.assetKey);
+    const altOutgoing = [...outgoing.values()].find((value) => value.assetKey !== tokenBought.assetKey);
+    if (altIncoming) {
+      tokenBought = altIncoming;
+    } else if (altOutgoing) {
+      tokenSold = altOutgoing;
+    } else {
+      return null;
+    }
+  }
+
+  const formatAmount = (entry) => {
+    if (entry.assetKey === "TON") {
+      return toTon(entry.rawAmount.toString());
+    }
+    if (typeof entry.decimals === "number") {
+      return toJetton(entry.rawAmount.toString(), entry.decimals);
+    }
+    return entry.rawAmount.toString();
+  };
+
+  return {
+    tokenBought: { asset: tokenBought.asset, amount: formatAmount(tokenBought) },
+    tokenSold: { asset: tokenSold.asset, amount: formatAmount(tokenSold) }
+  };
 };
