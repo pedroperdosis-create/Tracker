@@ -1,0 +1,23 @@
+{
+  "name": "ton-wallet-tracker",
+  "private": true,
+  "workspaces": ["apps/*", "packages/*"],
+  "scripts": {
+    "build": "npm run build -w apps/bot && npm run build -w apps/watcher",
+    "lint": "npm run lint -w apps/bot && npm run lint -w apps/watcher",
+    "start:bot": "node apps/bot/dist/index.js",
+    "start:watcher": "node apps/watcher/dist/index.js",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate deploy"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.10",
+    "typescript": "^5.5.4"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "pino": "^9.3.2",
+    "prisma": "^5.18.0",
+    "@prisma/client": "^5.18.0"
+  }
+}
