@@ -58,7 +58,7 @@ type TonApiAction = {
   };
   jetton_transfer?: {
     amount?: string;
-    jetton?: { symbol?: string; decimals?: number };
+    jetton?: { symbol?: string; decimals?: number; address?: string };
     sender?: { address?: string; name?: string };
     recipient?: { address?: string; name?: string };
     amount_usd?: number;
@@ -81,6 +81,7 @@ type NormalizedAction = {
   nftName?: string;
   nftCollection?: string;
   note?: string;
+  raw?: TonApiAction;
 };
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -160,7 +161,8 @@ const normalizeActions = (actions: TonApiAction[], trackedAddress: string): Norm
             asset: "TON",
             usd: action.ton_transfer.amount_usd ?? action.simple_preview?.value_usd,
             counterparty,
-            note
+            note,
+            raw: action
           }
         ];
       }
@@ -177,10 +179,11 @@ const normalizeActions = (actions: TonApiAction[], trackedAddress: string): Norm
             type: "JETTON",
             direction,
             amount: toJetton(action.jetton_transfer.amount, decimals),
-            asset: action.jetton_transfer.jetton?.symbol ?? "JETTON",
+            asset: action.jetton_transfer.jetton?.symbol ?? action.jetton_transfer.jetton?.address ?? "JETTON",
             usd: action.jetton_transfer.amount_usd ?? action.simple_preview?.value_usd,
             counterparty,
-            note
+            note,
+            raw: action
           }
         ];
       }
@@ -199,7 +202,8 @@ const normalizeActions = (actions: TonApiAction[], trackedAddress: string): Norm
             counterparty,
             nftName: action.nft_transfer.nft?.name ?? "NFT",
             nftCollection: action.nft_transfer.nft?.collection?.name ?? "Collection",
-            note
+            note,
+            raw: action
           }
         ];
       }
@@ -315,7 +319,9 @@ async function processWallet(wallet: { id: string; address: string; name: string
   });
   let maxLt = cursorBefore ?? 0n;
   let newCount = 0;
+  let normalizedCountTotal = 0;
   let insertedCount = 0;
+  let insertErrorsCount = 0;
   let notifiedCount = 0;
 
   for (const event of sorted) {
@@ -329,8 +335,18 @@ async function processWallet(wallet: { id: string; address: string; name: string
       continue;
     }
     newCount += 1;
+    const actionTypes = event.actions.map((action) => action.type);
     const normalized = normalizeActions(event.actions, wallet.address);
+    normalizedCountTotal += normalized.length;
+    logger.info(
+      { txHash: event.event_id, lt: eventLtRaw, actionTypes, normalizedCount: normalized.length },
+      "processing event"
+    );
     if (normalized.length === 0) {
+      logger.warn(
+        { txHash: event.event_id, lt: eventLtRaw, actionTypes },
+        "no normalized actions for event"
+      );
       maxLt = eventLt > maxLt ? eventLt : maxLt;
       continue;
     }
@@ -347,7 +363,7 @@ async function processWallet(wallet: { id: string; address: string; name: string
             asset: action.asset,
             amount: action.amount ?? null,
             counterparty: action.counterparty?.address ?? action.counterparty?.name ?? null,
-            metadata: action
+            metadata: { action, event: { id: event.event_id, lt: eventLtRaw } }
           }
         });
         createdActions.push(action);
@@ -356,6 +372,17 @@ async function processWallet(wallet: { id: string; address: string; name: string
         if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
           continue;
         }
+        insertErrorsCount += 1;
+        logger.error(
+          {
+            error,
+            txHash: event.event_id,
+            actionId: action.actionId,
+            type: action.type,
+            stack: error instanceof Error ? error.stack?.split("\n").slice(0, 3).join("\n") : undefined
+          },
+          "failed to insert wallet event"
+        );
         throw error;
       }
     }
@@ -386,14 +413,16 @@ async function processWallet(wallet: { id: string; address: string; name: string
       cursorBefore: cursorBefore?.toString() ?? null,
       maxFetchedLt: maxFetchedLt ? maxFetchedLt.toString() : null,
       newCount,
+      normalizedCountTotal,
       insertedCount,
+      insertErrorsCount,
       notifiedCount,
       cursorAfter: maxLt.toString()
     },
     "wallet processing summary"
   );
 
-  if (cursorBefore === null ? newCount > 0 : maxLt > cursorBefore) {
+  if (cursorBefore === null ? newCount > 0 : insertedCount > 0) {
     await prisma.wallet.update({ where: { id: wallet.id }, data: { lastEventLt: maxLt.toString() } });
   }
 }
