@@ -101,6 +101,14 @@ export class TonApiLimiter {
     );
   }
 
+  snapshot() {
+    return {
+      effectiveRps: this.state.effectiveRps,
+      inflight: this.state.inflight,
+      cooldownActive: Date.now() < this.state.cooldownUntil
+    };
+  }
+
   async schedule<T>(fn: () => Promise<T>): Promise<T> {
     await this.waitForSlot();
     try {
@@ -108,5 +116,14 @@ export class TonApiLimiter {
     } finally {
       this.release();
     }
+  }
+}
+
+export class TonApiError extends Error {
+  readonly status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
   }
 }

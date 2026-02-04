@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { buildSwapSummary } from "../src/swap.js";
+import { buildSwapSummary, getDirection } from "../src/swap.js";
 
 test("SwapSummary: jetton OUT + TON IN => swap", () => {
   const walletRaw = "0:wallet";
@@ -38,6 +38,13 @@ test("SwapSummary: jetton OUT + TON IN => swap", () => {
   assert.equal(summary.tokenSold?.amount, "1");
   assert.equal(summary.quote?.asset, "TON");
   assert.equal(summary.quote?.amount, "2");
+});
+
+test("Direction: internal transfer between tracked wallets", () => {
+  const walletA = "0:walletA";
+  const walletB = "0:walletB";
+  assert.equal(getDirection(walletA, walletA, walletB), "OUT");
+  assert.equal(getDirection(walletB, walletA, walletB), "IN");
 });
 
 test("SwapSummary: simple USDT transfer is not swap", () => {

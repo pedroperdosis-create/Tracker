@@ -83,6 +83,12 @@ export const getTonTransfer = (action: TonApiAction) =>
 
 export const isUsdJetton = (symbol?: string) => (symbol ?? "").toLowerCase().includes("usd");
 
+export const getDirection = (trackedRawAddress: string, sender?: string, recipient?: string) => {
+  if (sender === trackedRawAddress) return "OUT" as const;
+  if (recipient === trackedRawAddress) return "IN" as const;
+  return null;
+};
+
 const toJetton = (amount: string, decimals: number) => {
   const base = BigInt(amount);
   const divisor = BigInt(10) ** BigInt(decimals);
@@ -119,7 +125,8 @@ export const buildSwapSummary = (entries: ActionEntry[], trackedRawAddress: stri
     if (!transfer) continue;
     const sender = transfer.sender?.address;
     const recipient = transfer.recipient?.address;
-    if (sender !== trackedRawAddress && recipient !== trackedRawAddress) continue;
+    const direction = getDirection(trackedRawAddress, sender, recipient);
+    if (!direction) continue;
     const decimals = transfer.jetton?.decimals;
     const rawAmount = transfer.amount ? String(transfer.amount) : "0";
     const amount = typeof decimals === "number" ? toJetton(rawAmount, decimals) : rawAmount;
@@ -135,10 +142,10 @@ export const buildSwapSummary = (entries: ActionEntry[], trackedRawAddress: stri
         netUsdJetton.amount -= delta;
       }
     }
-    if (recipient === trackedRawAddress && !tokenBought) {
+    if (direction === "IN" && !tokenBought) {
       tokenBought = { asset, amount };
     }
-    if (sender === trackedRawAddress && !tokenSold) {
+    if (direction === "OUT" && !tokenSold) {
       tokenSold = { asset, amount };
     }
   }

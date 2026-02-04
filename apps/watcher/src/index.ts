@@ -7,10 +7,11 @@ import {
   SwapSummary,
   TonApiAction,
   buildSwapSummary,
+  getDirection,
   getJettonTransfer,
   getTonTransfer
 } from "./swap";
-import { TonApiLimiter } from "./tonapi";
+import { TonApiError, TonApiLimiter } from "./tonapi";
 import { prisma } from "./prisma";
 import {
   DEFAULT_LANGUAGE,
@@ -48,6 +49,9 @@ const tonapiLimiter = new TonApiLimiter({
   burst: TONAPI_BURST,
   concurrency: TONAPI_CONCURRENCY
 });
+
+const walletSchedule = new Map<string, { nextPollAt: number; backoffMs: number }>();
+let lastScheduleLogAt = 0;
 
 const bot = new Telegraf(BOT_TOKEN);
 
@@ -153,8 +157,8 @@ const normalizeActions = (
       if (action.type === "TonTransfer" && tonTransfer) {
         const sender = tonTransfer.sender?.address;
         const recipient = tonTransfer.recipient?.address;
-        if (sender !== trackedRawAddress && recipient !== trackedRawAddress) return [];
-        const direction = sender === trackedRawAddress ? "OUT" : "IN";
+        const direction = getDirection(trackedRawAddress, sender, recipient);
+        if (!direction) return [];
         const counterparty = sender === trackedRawAddress ? tonTransfer.recipient : tonTransfer.sender;
         logger.debug(
           {
@@ -186,8 +190,8 @@ const normalizeActions = (
         if (action.status && action.status !== "ok") return [];
         const sender = jettonTransfer.sender?.address;
         const recipient = jettonTransfer.recipient?.address;
-        if (sender !== trackedRawAddress && recipient !== trackedRawAddress) return [];
-        const direction = sender === trackedRawAddress ? "OUT" : "IN";
+        const direction = getDirection(trackedRawAddress, sender, recipient);
+        if (!direction) return [];
         const counterparty = sender === trackedRawAddress ? jettonTransfer.recipient : jettonTransfer.sender;
         const decimals = jettonTransfer.jetton?.decimals;
         const rawAmount = jettonTransfer.amount ? String(jettonTransfer.amount) : "0";
@@ -327,14 +331,18 @@ async function fetchEvents(address: string, lastLt?: string): Promise<TonApiEven
       { status: response.status, address, body: bodyText.slice(0, 200) },
       "tonapi request failed"
     );
-    throw new Error(`TonAPI error ${response.status}`);
+    throw new TonApiError(response.status, `TonAPI error ${response.status}`);
   }
   tonapiLimiter.markResponse(response.status);
   const data = (await response.json()) as { events?: TonApiEvent[] };
   return data.events ?? [];
 }
 
-async function processWallet(wallet: { id: string; address: string; name: string; lastEventLt: string | null; userId: string }) {
+type ProcessWalletResult = { newCount: number; notifiedCount: number; errorStatus?: number };
+
+async function processWallet(
+  wallet: { id: string; address: string; name: string; lastEventLt: string | null; userId: string }
+): Promise<ProcessWalletResult> {
   const user = await prisma.user.findUnique({ where: { id: wallet.userId } });
   if (!user) return;
   const lang = (user.language as Language) ?? DEFAULT_LANGUAGE;
@@ -345,7 +353,10 @@ async function processWallet(wallet: { id: string; address: string; name: string
     events = await fetchEvents(wallet.address, wallet.lastEventLt ?? undefined);
   } catch (error) {
     logger.warn({ error, wallet: wallet.id }, "failed to fetch events");
-    return;
+    if (error instanceof TonApiError) {
+    return { newCount: 0, notifiedCount: 0, errorStatus: error.status };
+    }
+    return { newCount: 0, notifiedCount: 0 };
   }
 
   const actionsCount = events.reduce((sum, event) => sum + (event.actions?.length ?? 0), 0);
@@ -546,6 +557,19 @@ async function processWallet(wallet: { id: string; address: string; name: string
 
 const jitter = () => Math.floor(50 + Math.random() * 200);
 
+const scheduleBackoff = (walletId: string, now: number, status?: number) => {
+  const current = walletSchedule.get(walletId) ?? { nextPollAt: 0, backoffMs: 0 };
+  const nextBackoff =
+    status === 429
+      ? Math.min(Math.max(BASE_POLL_INTERVAL_MS, current.backoffMs * 2 || BASE_POLL_INTERVAL_MS), MAX_BACKOFF_MS)
+      : Math.min(MAX_BACKOFF_MS, Math.max(1000, current.backoffMs));
+  walletSchedule.set(walletId, { nextPollAt: now + nextBackoff, backoffMs: nextBackoff });
+};
+
+const scheduleNext = (walletId: string, now: number, intervalMs: number) => {
+  walletSchedule.set(walletId, { nextPollAt: now + intervalMs, backoffMs: 0 });
+};
+
 async function poll() {
   const wallets = await prisma.wallet.findMany();
   const sample = wallets.slice(0, 2).map((wallet) => ({ id: wallet.id, address: wallet.address }));
@@ -557,17 +581,55 @@ async function poll() {
     }
     return { walletsCount: 0, newEvents: 0, notified: 0 };
   }
-  logger.info({ count: wallets.length, sample }, "poll tick");
+  const now = Date.now();
+  const dueWallets = wallets.filter((wallet) => {
+    const schedule = walletSchedule.get(wallet.id);
+    return !schedule || schedule.nextPollAt <= now;
+  });
+  const nextScheduled = wallets.reduce((next, wallet) => {
+    const schedule = walletSchedule.get(wallet.id);
+    if (!schedule) return next;
+    if (!next || schedule.nextPollAt < next.nextPollAt) {
+      return { id: wallet.id, nextPollAt: schedule.nextPollAt };
+    }
+    return next;
+  }, undefined as { id: string; nextPollAt: number } | undefined);
+
+  if (now - lastScheduleLogAt > 15000) {
+    lastScheduleLogAt = now;
+    const limiterSnapshot = tonapiLimiter.snapshot();
+    logger.info(
+      {
+        inflight: limiterSnapshot.inflight,
+        effectiveRps: limiterSnapshot.effectiveRps,
+        cooldownActive: limiterSnapshot.cooldownActive,
+        dueCount: dueWallets.length,
+        nextWallet: nextScheduled?.id ?? null,
+        nextPollAt: nextScheduled?.nextPollAt ?? null
+      },
+      "wallet scheduler"
+    );
+  }
+
+  logger.info({ count: wallets.length, dueCount: dueWallets.length, sample }, "poll tick");
   tonapiLimiter.logIfNeeded(logger);
   let newEvents = 0;
   let notified = 0;
-  for (let i = 0; i < wallets.length; i += MAX_PARALLEL_WALLETS) {
-    const batch = wallets.slice(i, i + MAX_PARALLEL_WALLETS);
+  for (let i = 0; i < dueWallets.length; i += MAX_PARALLEL_WALLETS) {
+    const batch = dueWallets.slice(i, i + MAX_PARALLEL_WALLETS);
     const results = await Promise.all(batch.map((wallet) => processWallet(wallet)));
-    for (const result of results) {
+    for (let index = 0; index < results.length; index += 1) {
+      const result = results[index];
+      const wallet = batch[index];
       if (!result) continue;
       newEvents += result.newCount;
       notified += result.notifiedCount;
+      if (result.errorStatus) {
+        scheduleBackoff(wallet.id, now, result.errorStatus);
+        continue;
+      }
+      const intervalMs = result.newCount > 0 ? FAST_POLL_INTERVAL_MS : BASE_POLL_INTERVAL_MS;
+      scheduleNext(wallet.id, now, intervalMs);
     }
     await sleep(200 + jitter());
   }
