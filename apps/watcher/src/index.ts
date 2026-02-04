@@ -2,6 +2,7 @@ import "dotenv/config";
 import pino from "pino";
 import { Telegraf } from "telegraf";
 import { Address } from "@ton/core";
+import WebSocket from "ws";
 import {
   ActionEntry,
   SwapSummary,
@@ -15,6 +16,7 @@ import { createEmptyProcessResult } from "./process-result";
 import type { ProcessWalletResult } from "./process-result";
 import { TonApiError, TonApiLimiter } from "./tonapi";
 import { prisma } from "./prisma";
+import { createDebouncedInFlightQueue } from "./ws-queue";
 import {
   DEFAULT_LANGUAGE,
   Language,
@@ -587,6 +589,23 @@ const extractWsAddress = (payload: Record<string, unknown>): string | null => {
   return null;
 };
 
+const extractWsMeta = (payload: Record<string, unknown>) => {
+  const txHash = payload.tx_hash ?? payload.txHash;
+  const txHashFromTx =
+    typeof payload.transaction === "object" && payload.transaction
+      ? (payload.transaction as Record<string, unknown>).hash
+      : undefined;
+  const params = payload.params;
+  const paramsTxHash =
+    params && typeof params === "object" ? (params as Record<string, unknown>).tx_hash : undefined;
+  const lt = payload.lt ?? payload.tx_lt;
+  const paramsLt = params && typeof params === "object" ? (params as Record<string, unknown>).lt : undefined;
+  return {
+    txHash: typeof txHash === "string" ? txHash : typeof txHashFromTx === "string" ? txHashFromTx : paramsTxHash,
+    lt: typeof lt === "string" ? lt : typeof paramsLt === "string" ? paramsLt : undefined
+  };
+};
+
 const buildWsUrl = () => {
   if (!TONCENTER_WS_URL) return null;
   try {
@@ -610,41 +629,67 @@ const startWebSocket = (
     logger.warn("ws mode enabled but TONCENTER_WS_URL is missing/invalid");
     return;
   }
-  const WsCtor = (globalThis as unknown as { WebSocket?: new (url: string) => WebSocket }).WebSocket;
-  if (!WsCtor) {
-    logger.warn("ws mode enabled but WebSocket is not available in this runtime");
-    return;
-  }
   let reconnectDelay = 1000;
   let ws: WebSocket | null = null;
+  const wsQueue = createDebouncedInFlightQueue<WsWallet>(1500, async (wallet) => {
+    try {
+      await processWallet(wallet);
+    } catch (error) {
+      logger.warn({ error }, "ws wallet processing failed");
+    }
+  });
+  const sanitizedWsUrl = (() => {
+    try {
+      const safeUrl = new URL(wsUrl);
+      safeUrl.searchParams.delete("api_key");
+      return safeUrl.toString();
+    } catch {
+      return wsUrl;
+    }
+  })();
   const connect = async () => {
-    logger.info("ws reconnecting");
-    ws = new WsCtor(wsUrl);
-    ws.onopen = async () => {
+    logger.info({ url: sanitizedWsUrl }, "ws connecting");
+    ws = new WebSocket(wsUrl);
+    ws.on("open", async () => {
       reconnectDelay = 1000;
       logger.info("ws connected");
-      if (TONCENTER_API_KEY) {
-        ws?.send(
-          JSON.stringify({ id: 1, jsonrpc: "2.0", method: "authenticate", params: { token: TONCENTER_API_KEY } })
-        );
-      }
-      const wallets = await walletsProvider();
-      ws?.send(
-        JSON.stringify({
-          id: 2,
-          jsonrpc: "2.0",
-          method: "subscribe",
-          params: { accounts: wallets.map((wallet) => wallet.address) }
-        })
-      );
-      logger.info({ count: wallets.length }, "ws subscribed");
-    };
-    ws.onmessage = (event) => {
       try {
-        const payload = JSON.parse(String(event.data)) as Record<string, unknown>;
+        const wallets = await walletsProvider();
+        const accountAddresses = wallets.map((wallet) => wallet.address);
+        const subscriptionPayloads = [
+          {
+            name: "subscribe_accounts",
+            payload: { id: 2, jsonrpc: "2.0", method: "subscribe", params: { accounts: accountAddresses } }
+          },
+          {
+            name: "subscribe_addresses",
+            payload: { id: 3, jsonrpc: "2.0", method: "subscribe", params: { addresses: accountAddresses } }
+          },
+          {
+            name: "subscribe_transactions",
+            payload: { id: 4, jsonrpc: "2.0", method: "subscribeTransactions", params: { accounts: accountAddresses } }
+          }
+        ];
+        for (const subscription of subscriptionPayloads) {
+          try {
+            ws?.send(JSON.stringify(subscription.payload));
+            logger.info({ variant: subscription.name }, "ws subscribe attempt");
+          } catch (error) {
+            logger.warn({ error, variant: subscription.name }, "ws subscribe failed; polling fallback continues");
+          }
+        }
+        logger.info({ count: wallets.length }, "ws subscribed");
+      } catch (error) {
+        logger.warn({ error }, "ws subscription init failed; polling fallback continues");
+      }
+    });
+    ws.on("message", (data) => {
+      try {
+        const payload = JSON.parse(data.toString()) as Record<string, unknown>;
         const address = extractWsAddress(payload);
         if (address) {
-          logger.info({ address }, "ws event received");
+          const meta = extractWsMeta(payload);
+          logger.info({ address, txHash: meta.txHash ?? null, lt: meta.lt ?? null }, "ws event received");
           const lookup = walletLookup();
           let wallet = lookup.get(address);
           if (!wallet) {
@@ -655,22 +700,23 @@ const startWebSocket = (
             }
           }
           if (wallet) {
-            processWallet(wallet).catch((error) => logger.warn({ error }, "ws wallet processing failed"));
+            wsQueue.trigger(wallet.id, wallet);
           }
         }
       } catch (error) {
         logger.warn({ error }, "ws message parse failed");
       }
-    };
-    ws.onclose = async () => {
-      logger.warn("ws disconnected");
+    });
+    ws.on("close", async (code, reason) => {
+      logger.warn({ code, reason: reason.toString() }, "ws disconnected");
       await sleep(reconnectDelay);
       reconnectDelay = Math.min(reconnectDelay * 2, 30000);
       connect();
-    };
-    ws.onerror = () => {
+    });
+    ws.on("error", (error) => {
+      logger.warn({ error }, "ws error; polling fallback continues");
       ws?.close();
-    };
+    });
   };
   connect();
 };
