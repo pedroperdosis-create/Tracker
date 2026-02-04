@@ -25,6 +25,25 @@ const backKeyboard = (lang: Language) =>
 const escapeHtml = (value: string) =>
   value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
+const isMessageNotModifiedError = (error: unknown) => {
+  if (!error || typeof error !== "object") return false;
+  const maybeError = error as { response?: { error_code?: number; description?: string } };
+  const errorCode = maybeError.response?.error_code;
+  const description = maybeError.response?.description ?? "";
+  return errorCode === 400 && description.toLowerCase().includes("message is not modified");
+};
+
+const safeEditMessageText = async (ctx: any, text: string, extra?: Parameters<typeof ctx.editMessageText>[1]) => {
+  try {
+    await ctx.editMessageText(text, extra);
+  } catch (error) {
+    if (isMessageNotModifiedError(error)) {
+      return;
+    }
+    throw error;
+  }
+};
+
 async function getOrCreateUser(telegramId: bigint, ctxUser: { username?: string; first_name?: string; last_name?: string }) {
   const existing = await prisma.user.findUnique({ where: { telegramId } });
   if (existing) {
@@ -53,7 +72,7 @@ async function ensureState(userId: string) {
 async function sendMenu(ctx: any, lang: Language) {
   const text = t(lang, "menuTitle");
   if (ctx.updateType === "callback_query") {
-    await ctx.editMessageText(text, menuKeyboard(lang));
+    await safeEditMessageText(ctx, text, menuKeyboard(lang));
     return;
   }
   await ctx.reply(text, menuKeyboard(lang));
@@ -84,33 +103,33 @@ bot.on("callback_query", async (ctx) => {
 
   if (data === "menu:add") {
     await prisma.userState.update({ where: { userId: user.id }, data: { step: "ADD_ADDRESS", tempAddress: null } });
-    await ctx.editMessageText(t(lang, "addAddressPrompt"), backKeyboard(lang));
+    await safeEditMessageText(ctx, t(lang, "addAddressPrompt"), backKeyboard(lang));
     return;
   }
 
   if (data === "menu:edit") {
     const wallets = await prisma.wallet.findMany({ where: { userId: user.id }, orderBy: { createdAt: "asc" } });
     if (wallets.length === 0) {
-      await ctx.editMessageText(t(lang, "walletsEmpty"), menuKeyboard(lang));
+      await safeEditMessageText(ctx, t(lang, "walletsEmpty"), menuKeyboard(lang));
       return;
     }
     const buttons = wallets.map((wallet) => [Markup.button.callback(wallet.name, `wallet:edit:${wallet.id}`)]);
     buttons.push([Markup.button.callback(t(lang, "back"), "menu:back")]);
-    await ctx.editMessageText(t(lang, "editChooseWallet"), Markup.inlineKeyboard(buttons));
+    await safeEditMessageText(ctx, t(lang, "editChooseWallet"), Markup.inlineKeyboard(buttons));
     return;
   }
 
   if (data === "menu:wallets") {
     const wallets = await prisma.wallet.findMany({ where: { userId: user.id }, orderBy: { createdAt: "asc" } });
     if (wallets.length === 0) {
-      await ctx.editMessageText(t(lang, "walletsEmpty"), menuKeyboard(lang));
+      await safeEditMessageText(ctx, t(lang, "walletsEmpty"), menuKeyboard(lang));
       return;
     }
     const lines = wallets.map((wallet) => {
       const address = normalizeAddress(wallet.address);
       return `${escapeHtml(wallet.name)} · <a href=\"${addressLink(address)}\">${shortAddress(address)}</a>`;
     });
-    await ctx.editMessageText(`${t(lang, "walletsTitle")}\n\n${lines.join("\n")}`, {
+    await safeEditMessageText(ctx, `${t(lang, "walletsTitle")}\n\n${lines.join("\n")}`, {
       parse_mode: "HTML",
       ...menuKeyboard(lang)
     });
@@ -118,7 +137,8 @@ bot.on("callback_query", async (ctx) => {
   }
 
   if (data === "menu:language") {
-    await ctx.editMessageText(
+    await safeEditMessageText(
+      ctx,
       t(lang, "languageTitle"),
       Markup.inlineKeyboard([
         [Markup.button.callback("Русский", "lang:ru"), Markup.button.callback("English", "lang:en")],
@@ -131,7 +151,7 @@ bot.on("callback_query", async (ctx) => {
   if (data.startsWith("lang:")) {
     const nextLang = data.split(":")[1] as Language;
     await prisma.user.update({ where: { id: user.id }, data: { language: nextLang } });
-    await ctx.editMessageText(t(nextLang, "languageSaved"), menuKeyboard(nextLang));
+    await safeEditMessageText(ctx, t(nextLang, "languageSaved"), menuKeyboard(nextLang));
     return;
   }
 
@@ -139,10 +159,11 @@ bot.on("callback_query", async (ctx) => {
     const walletId = data.split(":")[2];
     const wallet = await prisma.wallet.findFirst({ where: { id: walletId, userId: user.id } });
     if (!wallet) {
-      await ctx.editMessageText(t(lang, "walletsEmpty"), menuKeyboard(lang));
+      await safeEditMessageText(ctx, t(lang, "walletsEmpty"), menuKeyboard(lang));
       return;
     }
-    await ctx.editMessageText(
+    await safeEditMessageText(
+      ctx,
       `${escapeHtml(wallet.name)}\n${t(lang, "editChooseAction")}`,
       Markup.inlineKeyboard([
         [Markup.button.callback(t(lang, "editRename"), `wallet:action:rename:${wallet.id}`)],
@@ -157,21 +178,21 @@ bot.on("callback_query", async (ctx) => {
   if (data.startsWith("wallet:action:rename:")) {
     const walletId = data.split(":")[3];
     await prisma.userState.update({ where: { userId: user.id }, data: { step: "EDIT_RENAME", tempWalletId: walletId } });
-    await ctx.editMessageText(t(lang, "selectWalletToRename"), backKeyboard(lang));
+    await safeEditMessageText(ctx, t(lang, "selectWalletToRename"), backKeyboard(lang));
     return;
   }
 
   if (data.startsWith("wallet:action:address:")) {
     const walletId = data.split(":")[3];
     await prisma.userState.update({ where: { userId: user.id }, data: { step: "EDIT_CHANGE_ADDRESS", tempWalletId: walletId } });
-    await ctx.editMessageText(t(lang, "selectWalletToChangeAddress"), backKeyboard(lang));
+    await safeEditMessageText(ctx, t(lang, "selectWalletToChangeAddress"), backKeyboard(lang));
     return;
   }
 
   if (data.startsWith("wallet:action:delete:")) {
     const walletId = data.split(":")[3];
     await prisma.wallet.deleteMany({ where: { id: walletId, userId: user.id } });
-    await ctx.editMessageText(t(lang, "editDeleted"), menuKeyboard(lang));
+    await safeEditMessageText(ctx, t(lang, "editDeleted"), menuKeyboard(lang));
     return;
   }
 });

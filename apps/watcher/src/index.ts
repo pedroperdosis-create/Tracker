@@ -27,6 +27,8 @@ const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? 12000);
 
 const bot = new Telegraf(BOT_TOKEN);
 
+let lastEmptyWalletLogAt = 0;
+
 type TonApiEvent = {
   event_id: string;
   lt?: string;
@@ -243,6 +245,11 @@ async function fetchEvents(address: string, lastLt?: string): Promise<TonApiEven
   }
   const response = await fetch(url, { headers });
   if (!response.ok) {
+    const bodyText = await response.text();
+    logger.warn(
+      { status: response.status, address, body: bodyText.slice(0, 200) },
+      "tonapi request failed"
+    );
     throw new Error(`TonAPI error ${response.status}`);
   }
   const data = (await response.json()) as { events?: TonApiEvent[] };
@@ -261,6 +268,12 @@ async function processWallet(wallet: { id: string; address: string; name: string
     logger.warn({ error, wallet: wallet.id }, "failed to fetch events");
     return;
   }
+
+  const actionsCount = events.reduce((sum, event) => sum + (event.actions?.length ?? 0), 0);
+  logger.info(
+    { walletId: wallet.id, address: wallet.address, events: events.length, actions: actionsCount },
+    "tonapi events fetched"
+  );
 
   if (events.length === 0) return;
 
@@ -302,7 +315,18 @@ async function processWallet(wallet: { id: string; address: string; name: string
 
     if (createdActions.length > 0) {
       const message = formatMessage(wallet.name, event.event_id, createdActions, lang);
-      await bot.telegram.sendMessage(Number(user.telegramId), message, { parse_mode: "HTML" });
+      try {
+        await bot.telegram.sendMessage(Number(user.telegramId), message, { parse_mode: "HTML" });
+        logger.info(
+          { chatId: Number(user.telegramId), walletId: wallet.id, txHash: event.event_id },
+          "telegram notification sent"
+        );
+      } catch (error) {
+        logger.error(
+          { error, chatId: Number(user.telegramId), walletId: wallet.id, txHash: event.event_id },
+          "failed to send telegram notification"
+        );
+      }
     }
 
     maxLt = eventLt > maxLt ? eventLt : maxLt;
@@ -315,6 +339,16 @@ async function processWallet(wallet: { id: string; address: string; name: string
 
 async function poll() {
   const wallets = await prisma.wallet.findMany();
+  const sample = wallets.slice(0, 2).map((wallet) => ({ id: wallet.id, address: wallet.address }));
+  if (wallets.length === 0) {
+    const now = Date.now();
+    if (now - lastEmptyWalletLogAt > 60_000) {
+      logger.info("0 wallets tracked");
+      lastEmptyWalletLogAt = now;
+    }
+    return;
+  }
+  logger.info({ count: wallets.length, sample }, "poll tick");
   for (const wallet of wallets) {
     await processWallet(wallet);
     await sleep(200);
