@@ -132,9 +132,11 @@ bot.on("callback_query", async (ctx) => {
     }
     const lines = wallets.map((wallet) => `${wallet.name} · ${shortAddress(normalizeAddress(wallet.address))}`);
     const buttons = wallets.map((wallet) => [
-      Markup.button.url(`${wallet.name} · ${shortAddress(normalizeAddress(wallet.address))}`, addressLink(normalizeAddress(wallet.address)))
+      Markup.button.url(
+        `${wallet.name} · ${shortAddress(normalizeAddress(wallet.address))}`,
+        addressLink(normalizeAddress(wallet.address))
+      )
     ]);
-    buttons.push([Markup.button.callback(t(lang, "back"), "menu:back")]);
     await safeEditMessageText(ctx, `${t(lang, "walletsTitle")}\n\n${lines.join("\n")}`, Markup.inlineKeyboard(buttons));
     return;
   }
