@@ -102,7 +102,8 @@ export function t(lang: Language, key: MessageKey, vars?: Record<string, string 
   if (!vars) {
     return template;
   }
-  return Object.entries(vars).reduce(
+  const entries = Object.entries(vars) as Array<[string, string | number]>;
+  return entries.reduce<string>(
     (acc, [varKey, value]) => acc.replace(`{${varKey}}`, String(value)),
     template
   );
