@@ -25,7 +25,7 @@ import {
   txLink,
   t
 } from "@tracker/common";
-import { Prisma } from "@prisma/client";
+import { Prisma, type Wallet as PrismaWallet } from "@prisma/client";
 
 const logger = pino({ name: "watcher" });
 
@@ -88,7 +88,8 @@ type NormalizedAction = {
   raw?: TonApiAction;
 };
 
-type WsWallet = { id: string; address: string; raw: string };
+type ProcessWalletInput = Pick<PrismaWallet, "id" | "address" | "name" | "lastEventLt" | "userId">;
+type WsWallet = ProcessWalletInput;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -346,9 +347,7 @@ async function fetchEvents(address: string, lastLt?: string): Promise<TonApiEven
   return data.events ?? [];
 }
 
-async function processWallet(
-  wallet: { id: string; address: string; name: string; lastEventLt: string | null; userId: string }
-): Promise<ProcessWalletResult> {
+async function processWallet(wallet: ProcessWalletInput): Promise<ProcessWalletResult> {
   const user = await prisma.user.findUnique({ where: { id: wallet.userId } });
   if (!user) return { newCount: 0, notifiedCount: 0 };
   const lang = (user.language as Language) ?? DEFAULT_LANGUAGE;
@@ -751,12 +750,13 @@ async function start() {
     startWebSocket(
       async () => {
         const wallets = await prisma.wallet.findMany();
+        const wsWallets: ProcessWalletInput[] = wallets;
         wsWalletLookup = new Map(
-          wallets.flatMap((wallet) => {
+          wsWallets.flatMap((wallet) => {
             const raw = Address.parse(wallet.address).toRawString();
             return [
-              [wallet.address, { id: wallet.id, address: wallet.address, raw }],
-              [raw, { id: wallet.id, address: wallet.address, raw }]
+              [wallet.address, wallet],
+              [raw, wallet]
             ] as Array<[string, WsWallet]>;
           })
         );
