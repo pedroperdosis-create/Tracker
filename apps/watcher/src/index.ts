@@ -345,7 +345,7 @@ async function processWallet(
   wallet: { id: string; address: string; name: string; lastEventLt: string | null; userId: string }
 ): Promise<ProcessWalletResult> {
   const user = await prisma.user.findUnique({ where: { id: wallet.userId } });
-  if (!user) return createEmptyProcessResult();
+  if (!user) return { newCount: 0, notifiedCount: 0 };
   const lang = (user.language as Language) ?? DEFAULT_LANGUAGE;
   const walletRaw = Address.parse(wallet.address).toRawString();
 
