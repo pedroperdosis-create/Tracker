@@ -742,7 +742,10 @@ async function poll() {
 }
 
 async function start() {
-  logger.info("watcher started");
+  logger.info(
+    { wsMode: WS_MODE, toncenterWsConfigured: Boolean(TONCENTER_WS_URL) },
+    "watcher started"
+  );
   let backoffMs = 0;
   let nextInterval = BASE_POLL_INTERVAL_MS;
   let wsWalletLookup = new Map<string, WsWallet>();

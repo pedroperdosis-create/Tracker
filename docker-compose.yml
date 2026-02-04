@@ -16,6 +16,8 @@ services:
   migrator:
     build: .
     command: ["npm", "run", "prisma:migrate"]
+    env_file:
+      - .env
     environment:
       DATABASE_URL: ${DATABASE_URL}
     depends_on:
@@ -26,6 +28,8 @@ services:
   bot:
     build: .
     command: ["node", "apps/bot/dist/index.js"]
+    env_file:
+      - .env
     environment:
       BOT_TOKEN: ${BOT_TOKEN}
       DATABASE_URL: ${DATABASE_URL}
@@ -37,6 +41,8 @@ services:
   watcher:
     build: .
     command: ["node", "apps/watcher/dist/index.js"]
+    env_file:
+      - .env
     environment:
       BOT_TOKEN: ${BOT_TOKEN}
       DATABASE_URL: ${DATABASE_URL}
