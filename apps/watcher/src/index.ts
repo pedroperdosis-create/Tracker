@@ -34,6 +34,9 @@ type TonApiEvent = {
   lt?: string;
   timestamp?: number;
   actions: TonApiAction[];
+  transaction?: {
+    lt?: string;
+  };
 };
 
 type TonApiAction = {
@@ -107,6 +110,17 @@ const safeBigInt = (value?: string) => {
     return BigInt(value);
   } catch {
     return 0n;
+  }
+};
+
+const extractEventLt = (event: TonApiEvent): string | null => {
+  const lt = event.lt ?? event.transaction?.lt;
+  if (!lt) return null;
+  try {
+    BigInt(lt);
+    return lt;
+  } catch {
+    return null;
   }
 };
 
@@ -270,19 +284,51 @@ async function processWallet(wallet: { id: string; address: string; name: string
   }
 
   const actionsCount = events.reduce((sum, event) => sum + (event.actions?.length ?? 0), 0);
+  const sampleEvent = events[0];
+  const sampleLt = sampleEvent ? extractEventLt(sampleEvent) : null;
+  const maxFetchedLt = events.reduce((max, event) => {
+    const lt = extractEventLt(event);
+    if (!lt) return max;
+    const value = BigInt(lt);
+    return value > max ? value : max;
+  }, 0n);
   logger.info(
-    { walletId: wallet.id, address: wallet.address, events: events.length, actions: actionsCount },
+    {
+      walletId: wallet.id,
+      address: wallet.address,
+      events: events.length,
+      actions: actionsCount,
+      sample: sampleEvent ? { txHash: sampleEvent.event_id, lt: sampleLt } : null,
+      maxFetchedLt: maxFetchedLt ? maxFetchedLt.toString() : null
+    },
     "tonapi events fetched"
   );
 
   if (events.length === 0) return;
 
-  const sorted = events.sort((a, b) => Number(safeBigInt(a.lt) - safeBigInt(b.lt)));
-  let maxLt = wallet.lastEventLt ? safeBigInt(wallet.lastEventLt) : 0n;
+  const cursorBefore = wallet.lastEventLt ? BigInt(wallet.lastEventLt) : null;
+  const sorted = events.sort((a, b) => {
+    const aLt = extractEventLt(a);
+    const bLt = extractEventLt(b);
+    if (!aLt || !bLt) return 0;
+    return Number(BigInt(aLt) - BigInt(bLt));
+  });
+  let maxLt = cursorBefore ?? 0n;
+  let newCount = 0;
+  let insertedCount = 0;
+  let notifiedCount = 0;
 
   for (const event of sorted) {
-    const eventLt = safeBigInt(event.lt);
-    if (eventLt <= maxLt) continue;
+    const eventLtRaw = extractEventLt(event);
+    if (!eventLtRaw) {
+      logger.warn({ txHash: event.event_id }, "missing or invalid lt in event");
+      continue;
+    }
+    const eventLt = BigInt(eventLtRaw);
+    if (cursorBefore !== null && eventLt <= cursorBefore) {
+      continue;
+    }
+    newCount += 1;
     const normalized = normalizeActions(event.actions, wallet.address);
     if (normalized.length === 0) {
       maxLt = eventLt > maxLt ? eventLt : maxLt;
@@ -305,6 +351,7 @@ async function processWallet(wallet: { id: string; address: string; name: string
           }
         });
         createdActions.push(action);
+        insertedCount += 1;
       } catch (error) {
         if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
           continue;
@@ -317,6 +364,7 @@ async function processWallet(wallet: { id: string; address: string; name: string
       const message = formatMessage(wallet.name, event.event_id, createdActions, lang);
       try {
         await bot.telegram.sendMessage(Number(user.telegramId), message, { parse_mode: "HTML" });
+        notifiedCount += 1;
         logger.info(
           { chatId: Number(user.telegramId), walletId: wallet.id, txHash: event.event_id },
           "telegram notification sent"
@@ -332,7 +380,20 @@ async function processWallet(wallet: { id: string; address: string; name: string
     maxLt = eventLt > maxLt ? eventLt : maxLt;
   }
 
-  if (maxLt > safeBigInt(wallet.lastEventLt ?? "0")) {
+  logger.info(
+    {
+      walletId: wallet.id,
+      cursorBefore: cursorBefore?.toString() ?? null,
+      maxFetchedLt: maxFetchedLt ? maxFetchedLt.toString() : null,
+      newCount,
+      insertedCount,
+      notifiedCount,
+      cursorAfter: maxLt.toString()
+    },
+    "wallet processing summary"
+  );
+
+  if (cursorBefore === null ? newCount > 0 : maxLt > cursorBefore) {
     await prisma.wallet.update({ where: { id: wallet.id }, data: { lastEventLt: maxLt.toString() } });
   }
 }
