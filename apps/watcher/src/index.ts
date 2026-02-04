@@ -2,7 +2,7 @@ import "dotenv/config";
 import pino from "pino";
 import { Telegraf } from "telegraf";
 import { Address } from "@ton/core";
-import WebSocket from "ws";
+import WebSocket, { type RawData } from "ws";
 import {
   ActionEntry,
   SwapSummary,
@@ -683,7 +683,7 @@ const startWebSocket = (
         logger.warn({ error }, "ws subscription init failed; polling fallback continues");
       }
     });
-    ws.on("message", (data) => {
+    ws.on("message", (data: RawData) => {
       try {
         const payload = JSON.parse(data.toString()) as Record<string, unknown>;
         const address = extractWsAddress(payload);
@@ -707,13 +707,13 @@ const startWebSocket = (
         logger.warn({ error }, "ws message parse failed");
       }
     });
-    ws.on("close", async (code, reason) => {
+    ws.on("close", async (code: number, reason: Buffer) => {
       logger.warn({ code, reason: reason.toString() }, "ws disconnected");
       await sleep(reconnectDelay);
       reconnectDelay = Math.min(reconnectDelay * 2, 30000);
       connect();
     });
-    ws.on("error", (error) => {
+    ws.on("error", (error: Error) => {
       logger.warn({ error }, "ws error; polling fallback continues");
       ws?.close();
     });
