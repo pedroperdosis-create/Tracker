@@ -11,6 +11,7 @@ import {
   getJettonTransfer,
   getTonTransfer
 } from "./swap";
+import { createEmptyProcessResult } from "./process-result";
 import { TonApiError, TonApiLimiter } from "./tonapi";
 import { prisma } from "./prisma";
 import {
@@ -338,13 +339,13 @@ async function fetchEvents(address: string, lastLt?: string): Promise<TonApiEven
   return data.events ?? [];
 }
 
-type ProcessWalletResult = { newCount: number; notifiedCount: number; errorStatus?: number };
+import type { ProcessWalletResult } from "./process-result";
 
 async function processWallet(
   wallet: { id: string; address: string; name: string; lastEventLt: string | null; userId: string }
 ): Promise<ProcessWalletResult> {
   const user = await prisma.user.findUnique({ where: { id: wallet.userId } });
-  if (!user) return;
+  if (!user) return createEmptyProcessResult();
   const lang = (user.language as Language) ?? DEFAULT_LANGUAGE;
   const walletRaw = Address.parse(wallet.address).toRawString();
 
@@ -354,9 +355,9 @@ async function processWallet(
   } catch (error) {
     logger.warn({ error, wallet: wallet.id }, "failed to fetch events");
     if (error instanceof TonApiError) {
-    return { newCount: 0, notifiedCount: 0, errorStatus: error.status };
+      return { ...createEmptyProcessResult(), errorStatus: error.status };
     }
-    return { newCount: 0, notifiedCount: 0 };
+    return createEmptyProcessResult();
   }
 
   const actionsCount = events.reduce((sum, event) => sum + (event.actions?.length ?? 0), 0);
@@ -380,7 +381,7 @@ async function processWallet(
     "tonapi events fetched"
   );
 
-  if (events.length === 0) return { newCount: 0, notifiedCount: 0 };
+  if (events.length === 0) return createEmptyProcessResult();
 
   const cursorBefore = wallet.lastEventLt ? BigInt(wallet.lastEventLt) : null;
   const sorted = events.sort((a, b) => {
