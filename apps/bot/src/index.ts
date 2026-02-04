@@ -22,6 +22,8 @@ const menuKeyboard = (lang: Language) =>
 const backKeyboard = (lang: Language) =>
   Markup.inlineKeyboard([[Markup.button.callback(t(lang, "back"), "menu:back")]]);
 
+const noPreviewOptions = { link_preview_options: { is_disabled: true } };
+
 const escapeHtml = (value: string) =>
   value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
@@ -35,7 +37,7 @@ const isMessageNotModifiedError = (error: unknown) => {
 
 const safeEditMessageText = async (ctx: any, text: string, extra?: Parameters<typeof ctx.editMessageText>[1]) => {
   try {
-    await ctx.editMessageText(text, extra);
+    await ctx.editMessageText(text, { ...noPreviewOptions, ...(extra ?? {}) });
   } catch (error) {
     if (isMessageNotModifiedError(error)) {
       return;
@@ -75,7 +77,7 @@ async function sendMenu(ctx: any, lang: Language) {
     await safeEditMessageText(ctx, text, menuKeyboard(lang));
     return;
   }
-  await ctx.reply(text, menuKeyboard(lang));
+  await ctx.reply(text, { ...menuKeyboard(lang), ...noPreviewOptions });
 }
 
 bot.start(async (ctx) => {
@@ -87,7 +89,10 @@ bot.start(async (ctx) => {
 bot.command("cancel", async (ctx) => {
   const user = await getOrCreateUser(BigInt(ctx.from.id), ctx.from);
   await prisma.userState.update({ where: { userId: user.id }, data: { step: "NONE", tempAddress: null, tempWalletId: null } });
-  await ctx.reply(t(user.language as Language, "actionCanceled"), menuKeyboard(user.language as Language));
+  await ctx.reply(t(user.language as Language, "actionCanceled"), {
+    ...menuKeyboard(user.language as Language),
+    ...noPreviewOptions
+  });
 });
 
 bot.on("callback_query", async (ctx) => {
@@ -125,14 +130,12 @@ bot.on("callback_query", async (ctx) => {
       await safeEditMessageText(ctx, t(lang, "walletsEmpty"), menuKeyboard(lang));
       return;
     }
-    const lines = wallets.map((wallet) => {
-      const address = normalizeAddress(wallet.address);
-      return `${escapeHtml(wallet.name)} · <a href=\"${addressLink(address)}\">${shortAddress(address)}</a>`;
-    });
-    await safeEditMessageText(ctx, `${t(lang, "walletsTitle")}\n\n${lines.join("\n")}`, {
-      parse_mode: "HTML",
-      ...menuKeyboard(lang)
-    });
+    const lines = wallets.map((wallet) => `${wallet.name} · ${shortAddress(normalizeAddress(wallet.address))}`);
+    const buttons = wallets.map((wallet) => [
+      Markup.button.url(`${wallet.name} · ${shortAddress(normalizeAddress(wallet.address))}`, addressLink(normalizeAddress(wallet.address)))
+    ]);
+    buttons.push([Markup.button.callback(t(lang, "back"), "menu:back")]);
+    await safeEditMessageText(ctx, `${t(lang, "walletsTitle")}\n\n${lines.join("\n")}`, Markup.inlineKeyboard(buttons));
     return;
   }
 
@@ -206,21 +209,21 @@ bot.on("text", async (ctx) => {
 
   if (state.step === "ADD_ADDRESS") {
     if (!isValidAddress(text)) {
-      await ctx.reply(t(lang, "addInvalidAddress"));
+      await ctx.reply(t(lang, "addInvalidAddress"), noPreviewOptions);
       return;
     }
     await prisma.userState.update({
       where: { userId: user.id },
       data: { step: "ADD_NAME", tempAddress: normalizeAddress(text) }
     });
-    await ctx.reply(t(lang, "addNamePrompt"));
+    await ctx.reply(t(lang, "addNamePrompt"), noPreviewOptions);
     return;
   }
 
   if (state.step === "ADD_NAME") {
     if (!state.tempAddress) {
       await prisma.userState.update({ where: { userId: user.id }, data: { step: "ADD_ADDRESS" } });
-      await ctx.reply(t(lang, "addAddressPrompt"));
+      await ctx.reply(t(lang, "addAddressPrompt"), noPreviewOptions);
       return;
     }
     await prisma.wallet.create({
@@ -231,30 +234,30 @@ bot.on("text", async (ctx) => {
       }
     });
     await prisma.userState.update({ where: { userId: user.id }, data: { step: "NONE", tempAddress: null } });
-    await ctx.reply(t(lang, "addSaved"), menuKeyboard(lang));
+    await ctx.reply(t(lang, "addSaved"), { ...menuKeyboard(lang), ...noPreviewOptions });
     return;
   }
 
   if (state.step === "EDIT_RENAME") {
     if (!state.tempWalletId) {
       await prisma.userState.update({ where: { userId: user.id }, data: { step: "NONE" } });
-      await ctx.reply(t(lang, "actionCanceled"), menuKeyboard(lang));
+      await ctx.reply(t(lang, "actionCanceled"), { ...menuKeyboard(lang), ...noPreviewOptions });
       return;
     }
     await prisma.wallet.updateMany({ where: { id: state.tempWalletId, userId: user.id }, data: { name: text } });
     await prisma.userState.update({ where: { userId: user.id }, data: { step: "NONE", tempWalletId: null } });
-    await ctx.reply(t(lang, "editUpdated"), menuKeyboard(lang));
+    await ctx.reply(t(lang, "editUpdated"), { ...menuKeyboard(lang), ...noPreviewOptions });
     return;
   }
 
   if (state.step === "EDIT_CHANGE_ADDRESS") {
     if (!state.tempWalletId) {
       await prisma.userState.update({ where: { userId: user.id }, data: { step: "NONE" } });
-      await ctx.reply(t(lang, "actionCanceled"), menuKeyboard(lang));
+      await ctx.reply(t(lang, "actionCanceled"), { ...menuKeyboard(lang), ...noPreviewOptions });
       return;
     }
     if (!isValidAddress(text)) {
-      await ctx.reply(t(lang, "addInvalidAddress"));
+      await ctx.reply(t(lang, "addInvalidAddress"), noPreviewOptions);
       return;
     }
     await prisma.wallet.updateMany({
@@ -262,7 +265,7 @@ bot.on("text", async (ctx) => {
       data: { address: normalizeAddress(text) }
     });
     await prisma.userState.update({ where: { userId: user.id }, data: { step: "NONE", tempWalletId: null } });
-    await ctx.reply(t(lang, "editUpdated"), menuKeyboard(lang));
+    await ctx.reply(t(lang, "editUpdated"), { ...menuKeyboard(lang), ...noPreviewOptions });
     return;
   }
 });

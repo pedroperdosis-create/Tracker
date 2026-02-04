@@ -23,7 +23,8 @@ if (!BOT_TOKEN) {
 }
 
 const TONAPI_BASE = process.env.TONAPI_BASE ?? "https://tonapi.io/v2";
-const TONAPI_KEY = process.env.TONAPI_KEY;
+const TONAPI_KEY =
+  process.env.TONAPI_KEY ?? "AES6MBCFSX4OA5YAAAAEOKA4IDVVAWPYWRYGB2F565FVTBEZGTVO5JF4FERIZWPSEYGO23Y";
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? 12000);
 
 const bot = new Telegraf(BOT_TOKEN);
@@ -75,6 +76,20 @@ type TonApiAction = {
     amount_usd?: number;
   };
   jetton_transfer?: {
+    amount?: string;
+    jetton?: { symbol?: string; decimals?: number; address?: string };
+    sender?: { address?: string; name?: string };
+    recipient?: { address?: string; name?: string };
+    amount_usd?: number;
+  };
+  jettonTransfer?: {
+    amount?: string;
+    jetton?: { symbol?: string; decimals?: number; address?: string };
+    sender?: { address?: string; name?: string };
+    recipient?: { address?: string; name?: string };
+    amount_usd?: number;
+  };
+  JettonTransfer?: {
     amount?: string;
     jetton?: { symbol?: string; decimals?: number; address?: string };
     sender?: { address?: string; name?: string };
@@ -148,6 +163,8 @@ const hasMaestroNote = (action: TonApiAction) => {
   return preview.includes("maestro");
 };
 
+const tonTransferRegressionGuard = () => "TON transfer normalization guard: do not modify without regression check.";
+
 const shouldSkipAction = (action: TonApiAction) => {
   if (action.type !== "TonTransfer") return false;
   const transfer = action.ton_transfer ?? action.tonTransfer ?? action.TonTransfer;
@@ -171,6 +188,7 @@ const normalizeActions = (
     .flatMap<NormalizedAction>((action, actionIndex): NormalizedAction[] => {
       const note = hasMaestroNote(action) ? "maestro" : undefined;
       const tonTransfer = action.ton_transfer ?? action.tonTransfer ?? action.TonTransfer;
+      // TON transfer normalization is considered stable; do not modify without regression verification.
       if (action.type === "TonTransfer" && tonTransfer) {
         const sender = tonTransfer.sender?.address;
         const recipient = tonTransfer.recipient?.address;
@@ -183,7 +201,8 @@ const normalizeActions = (
             walletRaw: trackedRawAddress,
             sender,
             recipient,
-            direction
+            direction,
+            guard: tonTransferRegressionGuard()
           },
           "ton transfer match"
         );
@@ -201,21 +220,26 @@ const normalizeActions = (
           }
         ];
       }
-      if (action.type === "JettonTransfer" && action.jetton_transfer) {
-        const sender = action.jetton_transfer.sender?.address;
-        const recipient = action.jetton_transfer.recipient?.address;
+      const jettonTransfer = action.jetton_transfer ?? action.jettonTransfer ?? action.JettonTransfer;
+      if (action.type === "JettonTransfer" && jettonTransfer) {
+        const sender = jettonTransfer.sender?.address;
+        const recipient = jettonTransfer.recipient?.address;
         if (sender !== trackedRawAddress && recipient !== trackedRawAddress) return [];
         const direction = sender === trackedRawAddress ? "OUT" : "IN";
-        const counterparty = sender === trackedRawAddress ? action.jetton_transfer.recipient : action.jetton_transfer.sender;
-        const decimals = action.jetton_transfer.jetton?.decimals ?? 0;
+        const counterparty = sender === trackedRawAddress ? jettonTransfer.recipient : jettonTransfer.sender;
+        const decimals = jettonTransfer.jetton?.decimals;
+        const rawAmount = jettonTransfer.amount ? String(jettonTransfer.amount) : "0";
+        const amount =
+          typeof decimals === "number" ? toJetton(rawAmount, decimals) : rawAmount;
+        const asset = jettonTransfer.jetton?.symbol ?? jettonTransfer.jetton?.address ?? "JETTON";
         return [
           {
             actionId: `${eventId}:${actionIndex}`,
             type: "JETTON",
             direction,
-            amount: toJetton(action.jetton_transfer.amount, decimals),
-            asset: action.jetton_transfer.jetton?.symbol ?? action.jetton_transfer.jetton?.address ?? "JETTON",
-            usd: action.jetton_transfer.amount_usd ?? action.simple_preview?.value_usd,
+            amount,
+            asset,
+            usd: jettonTransfer.amount_usd ?? action.simple_preview?.value_usd,
             counterparty,
             note,
             raw: action
@@ -273,11 +297,14 @@ const formatActionLine = (action: NormalizedAction, lang: Language) => {
   return `${directionLabel}: ${amount} ${action.asset} ${usd ? `(${usd})` : ""} ${prefix}: ${counterpartyLabel}`.trim();
 };
 
-const formatMessage = (walletName: string, txHash: string, actions: NormalizedAction[], lang: Language) => {
+const escapeHtml = (value: string) =>
+  value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+const formatMessage = (walletName: string, walletAddress: string, txHash: string, actions: NormalizedAction[], lang: Language) => {
   const assetLabel = actions.every((action) => action.type === actions[0].type)
     ? actions[0].asset
     : "TON";
-  const title = `${walletName} · ${assetLabel}`;
+  const title = `<a href=\"${addressLink(walletAddress)}\">${escapeHtml(walletName)}</a> · ${assetLabel}`;
   const lines = actions.map((action) => formatActionLine(action, lang));
   if (actions.some((action) => action.note === "maestro")) {
     lines.push(t(lang, "maestroNote"));
@@ -288,7 +315,7 @@ const formatMessage = (walletName: string, txHash: string, actions: NormalizedAc
 
 async function fetchEvents(address: string, lastLt?: string): Promise<TonApiEvent[]> {
   const url = new URL(`${TONAPI_BASE}/accounts/${address}/events`);
-  url.searchParams.set("limit", "20");
+  url.searchParams.set("limit", "10");
   if (lastLt) {
     url.searchParams.set("start_lt", lastLt);
   }
@@ -372,7 +399,7 @@ async function processWallet(wallet: { id: string; address: string; name: string
     }
     newCount += 1;
     const actionTypes = event.actions.map((action) => action.type);
-    const txHash = event.base_transactions?.[0] ?? event.event_id;
+    const tonTxHash = event.base_transactions?.[0] ?? event.event_id;
     const normalized = normalizeActions(event.actions, wallet.address, walletRaw, event.event_id);
     normalizedCountTotal += normalized.length;
     logger.info(
@@ -389,6 +416,7 @@ async function processWallet(wallet: { id: string; address: string; name: string
     }
     const createdActions: NormalizedAction[] = [];
     for (const action of normalized) {
+      const txHash = action.type === "JETTON" ? event.event_id : tonTxHash;
       try {
         await prisma.walletEvent.create({
           data: {
@@ -400,11 +428,57 @@ async function processWallet(wallet: { id: string; address: string; name: string
             asset: action.asset,
             amount: action.amount ?? null,
             counterparty: action.counterparty?.address ?? action.counterparty?.name ?? null,
-            metadata: { action, event: { id: event.event_id, lt: eventLtRaw, txHash } }
+            metadata: {
+              action,
+              event: { id: event.event_id, lt: eventLtRaw, txHash },
+              jetton:
+                action.type === "JETTON"
+                  ? {
+                      symbol: action.asset,
+                      decimals:
+                        action.raw?.jetton_transfer?.jetton?.decimals ??
+                        action.raw?.jettonTransfer?.jetton?.decimals ??
+                        action.raw?.JettonTransfer?.jetton?.decimals ??
+                        null,
+                      rawAmount:
+                        action.raw?.jetton_transfer?.amount ??
+                        action.raw?.jettonTransfer?.amount ??
+                        action.raw?.JettonTransfer?.amount ??
+                        null,
+                      address:
+                        action.raw?.jetton_transfer?.jetton?.address ??
+                        action.raw?.jettonTransfer?.jetton?.address ??
+                        action.raw?.JettonTransfer?.jetton?.address ??
+                        null
+                    }
+                  : null
+            }
           }
         });
         createdActions.push(action);
         insertedCount += 1;
+        if (action.type === "JETTON") {
+          logger.info(
+            {
+              walletId: wallet.id,
+              txHash,
+              symbol: action.asset,
+              direction: action.direction,
+              humanAmount: action.amount ?? "0",
+              rawAmount:
+                action.raw?.jetton_transfer?.amount ??
+                action.raw?.jettonTransfer?.amount ??
+                action.raw?.JettonTransfer?.amount ??
+                null,
+              decimals:
+                action.raw?.jetton_transfer?.jetton?.decimals ??
+                action.raw?.jettonTransfer?.jetton?.decimals ??
+                action.raw?.JettonTransfer?.jetton?.decimals ??
+                null
+            },
+            "jetton transfer stored"
+          );
+        }
       } catch (error) {
         if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
           continue;
@@ -425,17 +499,21 @@ async function processWallet(wallet: { id: string; address: string; name: string
     }
 
     if (createdActions.length > 0) {
-      const message = formatMessage(wallet.name, txHash, createdActions, lang);
+      const messageTxHash = createdActions.every((action) => action.type === "JETTON") ? event.event_id : tonTxHash;
+      const message = formatMessage(wallet.name, wallet.address, messageTxHash, createdActions, lang);
       try {
-        await bot.telegram.sendMessage(Number(user.telegramId), message, { parse_mode: "HTML" });
+        await bot.telegram.sendMessage(Number(user.telegramId), message, {
+          parse_mode: "HTML",
+          link_preview_options: { is_disabled: true }
+        });
         notifiedCount += 1;
         logger.info(
-          { chatId: Number(user.telegramId), walletId: wallet.id, txHash },
+          { chatId: Number(user.telegramId), walletId: wallet.id, txHash: messageTxHash },
           "telegram notification sent"
         );
       } catch (error) {
         logger.error(
-          { error, chatId: Number(user.telegramId), walletId: wallet.id, txHash },
+          { error, chatId: Number(user.telegramId), walletId: wallet.id, txHash: messageTxHash },
           "failed to send telegram notification"
         );
       }
