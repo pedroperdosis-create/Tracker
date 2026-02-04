@@ -51,6 +51,10 @@ const tonapiLimiter = new TonApiLimiter({
   concurrency: TONAPI_CONCURRENCY
 });
 
+const WS_MODE = process.env.WS_MODE === "1";
+const TONCENTER_WS_URL = process.env.TONCENTER_WS_URL;
+const TONCENTER_API_KEY = process.env.TONCENTER_API_KEY;
+
 const walletSchedule = new Map<string, { nextPollAt: number; backoffMs: number }>();
 let lastScheduleLogAt = 0;
 
@@ -82,6 +86,8 @@ type NormalizedAction = {
   note?: string;
   raw?: TonApiAction;
 };
+
+type WsWallet = { id: string; address: string; raw: string };
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -571,6 +577,106 @@ const scheduleNext = (walletId: string, now: number, intervalMs: number) => {
   walletSchedule.set(walletId, { nextPollAt: now + intervalMs, backoffMs: 0 });
 };
 
+const extractWsAddress = (payload: Record<string, unknown>): string | null => {
+  const direct = payload.account ?? payload.address ?? payload.account_id ?? payload.addr;
+  if (typeof direct === "string") return direct;
+  const params = payload.params;
+  if (params && typeof params === "object") {
+    const paramsRecord = params as Record<string, unknown>;
+    const nested = paramsRecord.account ?? paramsRecord.address ?? paramsRecord.account_id ?? paramsRecord.addr;
+    if (typeof nested === "string") return nested;
+  }
+  return null;
+};
+
+const buildWsUrl = () => {
+  if (!TONCENTER_WS_URL) return null;
+  try {
+    const url = new URL(TONCENTER_WS_URL);
+    if (TONCENTER_API_KEY) {
+      url.searchParams.set("api_key", TONCENTER_API_KEY);
+    }
+    return url.toString();
+  } catch {
+    return null;
+  }
+};
+
+const startWebSocket = (
+  walletsProvider: () => Promise<WsWallet[]>,
+  walletLookup: () => Map<string, WsWallet>
+) => {
+  if (!WS_MODE) return;
+  const wsUrl = buildWsUrl();
+  if (!wsUrl) {
+    logger.warn("ws mode enabled but TONCENTER_WS_URL is missing/invalid");
+    return;
+  }
+  const WsCtor = (globalThis as unknown as { WebSocket?: new (url: string) => WebSocket }).WebSocket;
+  if (!WsCtor) {
+    logger.warn("ws mode enabled but WebSocket is not available in this runtime");
+    return;
+  }
+  let reconnectDelay = 1000;
+  let ws: WebSocket | null = null;
+  const connect = async () => {
+    logger.info("ws reconnecting");
+    ws = new WsCtor(wsUrl);
+    ws.onopen = async () => {
+      reconnectDelay = 1000;
+      logger.info("ws connected");
+      if (TONCENTER_API_KEY) {
+        ws?.send(
+          JSON.stringify({ id: 1, jsonrpc: "2.0", method: "authenticate", params: { token: TONCENTER_API_KEY } })
+        );
+      }
+      const wallets = await walletsProvider();
+      ws?.send(
+        JSON.stringify({
+          id: 2,
+          jsonrpc: "2.0",
+          method: "subscribe",
+          params: { accounts: wallets.map((wallet) => wallet.address) }
+        })
+      );
+      logger.info({ count: wallets.length }, "ws subscribed");
+    };
+    ws.onmessage = (event) => {
+      try {
+        const payload = JSON.parse(String(event.data)) as Record<string, unknown>;
+        const address = extractWsAddress(payload);
+        if (address) {
+          logger.info({ address }, "ws event received");
+          const lookup = walletLookup();
+          let wallet = lookup.get(address);
+          if (!wallet) {
+            try {
+              wallet = lookup.get(Address.parse(address).toRawString());
+            } catch {
+              wallet = undefined;
+            }
+          }
+          if (wallet) {
+            processWallet(wallet).catch((error) => logger.warn({ error }, "ws wallet processing failed"));
+          }
+        }
+      } catch (error) {
+        logger.warn({ error }, "ws message parse failed");
+      }
+    };
+    ws.onclose = async () => {
+      logger.warn("ws disconnected");
+      await sleep(reconnectDelay);
+      reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+      connect();
+    };
+    ws.onerror = () => {
+      ws?.close();
+    };
+  };
+  connect();
+};
+
 async function poll() {
   const wallets = await prisma.wallet.findMany();
   const sample = wallets.slice(0, 2).map((wallet) => ({ id: wallet.id, address: wallet.address }));
@@ -641,6 +747,25 @@ async function start() {
   logger.info("watcher started");
   let backoffMs = 0;
   let nextInterval = BASE_POLL_INTERVAL_MS;
+  let wsWalletLookup = new Map<string, WsWallet>();
+  if (WS_MODE) {
+    startWebSocket(
+      async () => {
+        const wallets = await prisma.wallet.findMany();
+        wsWalletLookup = new Map(
+          wallets.flatMap((wallet) => {
+            const raw = Address.parse(wallet.address).toRawString();
+            return [
+              [wallet.address, { id: wallet.id, address: wallet.address, raw }],
+              [raw, { id: wallet.id, address: wallet.address, raw }]
+            ] as Array<[string, WsWallet]>;
+          })
+        );
+        return Array.from(wsWalletLookup.values());
+      },
+      () => wsWalletLookup
+    );
+  }
   while (true) {
     const startAt = Date.now();
     try {
