@@ -2,6 +2,14 @@ import "dotenv/config";
 import pino from "pino";
 import { Telegraf } from "telegraf";
 import { Address } from "@ton/core";
+import {
+  ActionEntry,
+  SwapSummary,
+  TonApiAction,
+  buildSwapSummary,
+  getJettonTransfer,
+  getTonTransfer
+} from "./swap";
 import { prisma } from "./prisma";
 import {
   DEFAULT_LANGUAGE,
@@ -25,9 +33,11 @@ if (!BOT_TOKEN) {
 const TONAPI_BASE = process.env.TONAPI_BASE ?? "https://tonapi.io/v2";
 const TONAPI_KEY =
   process.env.TONAPI_KEY ?? "AES6MBCFSX4OA5YAAAAEOKA4IDVVAWPYWRYGB2F565FVTBEZGTVO5JF4FERIZWPSEYGO23Y";
-const BASE_POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? 12000);
-const FAST_POLL_INTERVAL_MS = Number(process.env.FAST_POLL_INTERVAL_MS ?? 3000);
+const FAST_MODE = process.env.FAST_MODE === "1";
+const BASE_POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? (FAST_MODE ? 2000 : 5000));
+const FAST_POLL_INTERVAL_MS = Number(process.env.FAST_POLL_INTERVAL_MS ?? (FAST_MODE ? 1500 : 3000));
 const MAX_BACKOFF_MS = Number(process.env.MAX_POLL_BACKOFF_MS ?? 60000);
+const MAX_PARALLEL_WALLETS = Number(process.env.MAX_PARALLEL_WALLETS ?? 3);
 
 const bot = new Telegraf(BOT_TOKEN);
 
@@ -44,67 +54,6 @@ type TonApiEvent = {
   base_transactions?: string[];
 };
 
-type TonApiAction = {
-  action_id?: string;
-  type: string;
-  status?: string;
-  simple_preview?: {
-    name?: string;
-    description?: string;
-    value_usd?: number;
-  };
-  ton_transfer?: {
-    amount?: string;
-    sender?: { address?: string; name?: string };
-    recipient?: { address?: string; name?: string };
-    is_internal?: boolean;
-    comment?: string;
-    amount_usd?: number;
-  };
-  tonTransfer?: {
-    amount?: string;
-    sender?: { address?: string; name?: string };
-    recipient?: { address?: string; name?: string };
-    is_internal?: boolean;
-    comment?: string;
-    amount_usd?: number;
-  };
-  TonTransfer?: {
-    amount?: string;
-    sender?: { address?: string; name?: string };
-    recipient?: { address?: string; name?: string };
-    is_internal?: boolean;
-    comment?: string;
-    amount_usd?: number;
-  };
-  jetton_transfer?: {
-    amount?: string;
-    jetton?: { symbol?: string; decimals?: number; address?: string };
-    sender?: { address?: string; name?: string };
-    recipient?: { address?: string; name?: string };
-    amount_usd?: number;
-  };
-  jettonTransfer?: {
-    amount?: string;
-    jetton?: { symbol?: string; decimals?: number; address?: string };
-    sender?: { address?: string; name?: string };
-    recipient?: { address?: string; name?: string };
-    amount_usd?: number;
-  };
-  JettonTransfer?: {
-    amount?: string;
-    jetton?: { symbol?: string; decimals?: number; address?: string };
-    sender?: { address?: string; name?: string };
-    recipient?: { address?: string; name?: string };
-    amount_usd?: number;
-  };
-  nft_transfer?: {
-    sender?: { address?: string; name?: string };
-    recipient?: { address?: string; name?: string };
-    nft?: { name?: string; collection?: { name?: string } };
-  };
-};
-
 type NormalizedAction = {
   actionId: string;
   type: "TON" | "JETTON" | "NFT";
@@ -117,22 +66,6 @@ type NormalizedAction = {
   nftCollection?: string;
   note?: string;
   raw?: TonApiAction;
-};
-
-type ActionEntry = {
-  action: TonApiAction;
-  index: number;
-};
-
-type SwapToken = {
-  asset: string;
-  amount: string;
-};
-
-type SwapSummary = {
-  tokenBought?: SwapToken;
-  tokenSold?: SwapToken;
-  quote?: SwapToken;
 };
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -194,96 +127,6 @@ const shouldSkipAction = (action: TonApiAction) => {
   return false;
 };
 
-const getJettonTransfer = (action: TonApiAction) =>
-  action.jetton_transfer ?? action.jettonTransfer ?? action.JettonTransfer;
-
-const getTonTransfer = (action: TonApiAction) =>
-  action.ton_transfer ?? action.tonTransfer ?? action.TonTransfer;
-
-const isUsdJetton = (symbol?: string) => (symbol ?? "").toLowerCase().includes("usd");
-
-const buildSwapSummary = (entries: ActionEntry[], trackedRawAddress: string): SwapSummary | null => {
-  const jettonEntries = entries.filter(({ action }) => action.type === "JettonTransfer" && getJettonTransfer(action));
-  const tonEntries = entries.filter(({ action }) => action.type === "TonTransfer" && getTonTransfer(action));
-
-  if (jettonEntries.length === 0) {
-    return null;
-  }
-
-  let tokenBought: SwapToken | undefined;
-  let tokenSold: SwapToken | undefined;
-
-  let netUsdJetton: { amount: bigint; symbol?: string } | null = null;
-
-  for (const { action } of jettonEntries) {
-    if (action.status && action.status !== "ok") continue;
-    const transfer = getJettonTransfer(action);
-    if (!transfer) continue;
-    const sender = transfer.sender?.address;
-    const recipient = transfer.recipient?.address;
-    if (sender !== trackedRawAddress && recipient !== trackedRawAddress) continue;
-    const decimals = transfer.jetton?.decimals;
-    const rawAmount = transfer.amount ? String(transfer.amount) : "0";
-    const amount = typeof decimals === "number" ? toJetton(rawAmount, decimals) : rawAmount;
-    const asset = transfer.jetton?.symbol ?? transfer.jetton?.address ?? "JETTON";
-    if (isUsdJetton(transfer.jetton?.symbol)) {
-      const delta = BigInt(rawAmount);
-      if (!netUsdJetton) {
-        netUsdJetton = { amount: 0n, symbol: transfer.jetton?.symbol };
-      }
-      if (recipient === trackedRawAddress) {
-        netUsdJetton.amount += delta;
-      } else if (sender === trackedRawAddress) {
-        netUsdJetton.amount -= delta;
-      }
-    }
-    if (recipient === trackedRawAddress && !tokenBought) {
-      tokenBought = { asset, amount };
-    }
-    if (sender === trackedRawAddress && !tokenSold) {
-      tokenSold = { asset, amount };
-    }
-  }
-
-  if (!tokenBought && !tokenSold) {
-    return null;
-  }
-
-  let quote: SwapToken | undefined;
-
-  if (tonEntries.length > 0) {
-    let netTon = 0n;
-    for (const { action } of tonEntries) {
-      const transfer = getTonTransfer(action);
-      if (!transfer) continue;
-      const sender = transfer.sender?.address;
-      const recipient = transfer.recipient?.address;
-      if (sender === trackedRawAddress) {
-        netTon -= BigInt(transfer.amount ?? "0");
-      } else if (recipient === trackedRawAddress) {
-        netTon += BigInt(transfer.amount ?? "0");
-      }
-    }
-    if (netTon !== 0n) {
-      quote = { asset: "TON", amount: toTon(netTon < 0n ? (-netTon).toString() : netTon.toString()) };
-    }
-  }
-
-  if (!quote && netUsdJetton && netUsdJetton.amount !== 0n) {
-    const decimals = jettonEntries
-      .map(({ action }) => getJettonTransfer(action)?.jetton?.decimals)
-      .find((value) => typeof value === "number");
-    const rawAmount = netUsdJetton.amount < 0n ? (-netUsdJetton.amount).toString() : netUsdJetton.amount.toString();
-    const amount = typeof decimals === "number" ? toJetton(rawAmount, decimals) : rawAmount;
-    quote = { asset: netUsdJetton.symbol ?? "USD₮", amount };
-  }
-
-  if (!quote && !(tokenBought && tokenSold)) {
-    return null;
-  }
-
-  return { tokenBought, tokenSold, quote };
-};
 const normalizeActions = (
   entries: ActionEntry[],
   trackedAddress: string,
@@ -689,6 +532,8 @@ async function processWallet(wallet: { id: string; address: string; name: string
   return { newCount, notifiedCount };
 }
 
+const jitter = () => Math.floor(50 + Math.random() * 200);
+
 async function poll() {
   const wallets = await prisma.wallet.findMany();
   const sample = wallets.slice(0, 2).map((wallet) => ({ id: wallet.id, address: wallet.address }));
@@ -703,13 +548,15 @@ async function poll() {
   logger.info({ count: wallets.length, sample }, "poll tick");
   let newEvents = 0;
   let notified = 0;
-  for (const wallet of wallets) {
-    const result = await processWallet(wallet);
-    if (result) {
+  for (let i = 0; i < wallets.length; i += MAX_PARALLEL_WALLETS) {
+    const batch = wallets.slice(i, i + MAX_PARALLEL_WALLETS);
+    const results = await Promise.all(batch.map((wallet) => processWallet(wallet)));
+    for (const result of results) {
+      if (!result) continue;
       newEvents += result.newCount;
       notified += result.notifiedCount;
     }
-    await sleep(200);
+    await sleep(200 + jitter());
   }
   return { walletsCount: wallets.length, newEvents, notified };
 }
@@ -731,7 +578,7 @@ async function start() {
       backoffMs = Math.min(Math.max(BASE_POLL_INTERVAL_MS, backoffMs * 2 || BASE_POLL_INTERVAL_MS), MAX_BACKOFF_MS);
     }
     const elapsed = Date.now() - startAt;
-    const wait = Math.max(nextInterval + backoffMs - elapsed, 1000);
+    const wait = Math.max(nextInterval + backoffMs - elapsed + jitter(), 1000);
     await sleep(wait);
   }
 }
