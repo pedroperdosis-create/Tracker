@@ -1,6 +1,7 @@
 import "dotenv/config";
 import pino from "pino";
 import { Telegraf } from "telegraf";
+import { Address } from "@ton/core";
 import { prisma } from "./prisma";
 import {
   DEFAULT_LANGUAGE,
@@ -37,6 +38,7 @@ type TonApiEvent = {
   transaction?: {
     lt?: string;
   };
+  base_transactions?: string[];
 };
 
 type TonApiAction = {
@@ -49,6 +51,22 @@ type TonApiAction = {
     value_usd?: number;
   };
   ton_transfer?: {
+    amount?: string;
+    sender?: { address?: string; name?: string };
+    recipient?: { address?: string; name?: string };
+    is_internal?: boolean;
+    comment?: string;
+    amount_usd?: number;
+  };
+  tonTransfer?: {
+    amount?: string;
+    sender?: { address?: string; name?: string };
+    recipient?: { address?: string; name?: string };
+    is_internal?: boolean;
+    comment?: string;
+    amount_usd?: number;
+  };
+  TonTransfer?: {
     amount?: string;
     sender?: { address?: string; name?: string };
     recipient?: { address?: string; name?: string };
@@ -132,34 +150,51 @@ const hasMaestroNote = (action: TonApiAction) => {
 
 const shouldSkipAction = (action: TonApiAction) => {
   if (action.type !== "TonTransfer") return false;
-  if (action.ton_transfer?.is_internal) return true;
-  const comment = (action.ton_transfer?.comment ?? "").toLowerCase();
+  const transfer = action.ton_transfer ?? action.tonTransfer ?? action.TonTransfer;
+  if (transfer?.is_internal) return true;
+  const comment = (transfer?.comment ?? "").toLowerCase();
   if (comment.includes("obvjazka") || comment.includes("wrap") || comment.includes("wrapping")) {
     return true;
   }
   return false;
 };
 
-const normalizeActions = (actions: TonApiAction[], trackedAddress: string): NormalizedAction[] => {
+const normalizeActions = (
+  actions: TonApiAction[],
+  trackedAddress: string,
+  trackedRawAddress: string,
+  eventId: string
+): NormalizedAction[] => {
   return actions
     .filter((action) => action.status !== "failed")
     .filter((action) => !shouldSkipAction(action))
-    .flatMap<NormalizedAction>((action): NormalizedAction[] => {
+    .flatMap<NormalizedAction>((action, actionIndex): NormalizedAction[] => {
       const note = hasMaestroNote(action) ? "maestro" : undefined;
-      if (action.type === "TonTransfer" && action.ton_transfer) {
-        const sender = action.ton_transfer.sender?.address;
-        const recipient = action.ton_transfer.recipient?.address;
-        if (sender !== trackedAddress && recipient !== trackedAddress) return [];
-        const direction = sender === trackedAddress ? "OUT" : "IN";
-        const counterparty = sender === trackedAddress ? action.ton_transfer.recipient : action.ton_transfer.sender;
+      const tonTransfer = action.ton_transfer ?? action.tonTransfer ?? action.TonTransfer;
+      if (action.type === "TonTransfer" && tonTransfer) {
+        const sender = tonTransfer.sender?.address;
+        const recipient = tonTransfer.recipient?.address;
+        if (sender !== trackedRawAddress && recipient !== trackedRawAddress) return [];
+        const direction = sender === trackedRawAddress ? "OUT" : "IN";
+        const counterparty = sender === trackedRawAddress ? tonTransfer.recipient : tonTransfer.sender;
+        logger.debug(
+          {
+            walletAddress: trackedAddress,
+            walletRaw: trackedRawAddress,
+            sender,
+            recipient,
+            direction
+          },
+          "ton transfer match"
+        );
         return [
           {
-            actionId: action.action_id ?? `${action.type}-${sender}-${recipient}-${action.ton_transfer.amount ?? "0"}`,
+            actionId: `${eventId}:${actionIndex}`,
             type: "TON",
             direction,
-            amount: toTon(action.ton_transfer.amount),
+            amount: toTon(tonTransfer.amount),
             asset: "TON",
-            usd: action.ton_transfer.amount_usd ?? action.simple_preview?.value_usd,
+            usd: tonTransfer.amount_usd ?? action.simple_preview?.value_usd,
             counterparty,
             note,
             raw: action
@@ -169,13 +204,13 @@ const normalizeActions = (actions: TonApiAction[], trackedAddress: string): Norm
       if (action.type === "JettonTransfer" && action.jetton_transfer) {
         const sender = action.jetton_transfer.sender?.address;
         const recipient = action.jetton_transfer.recipient?.address;
-        if (sender !== trackedAddress && recipient !== trackedAddress) return [];
-        const direction = sender === trackedAddress ? "OUT" : "IN";
-        const counterparty = sender === trackedAddress ? action.jetton_transfer.recipient : action.jetton_transfer.sender;
+        if (sender !== trackedRawAddress && recipient !== trackedRawAddress) return [];
+        const direction = sender === trackedRawAddress ? "OUT" : "IN";
+        const counterparty = sender === trackedRawAddress ? action.jetton_transfer.recipient : action.jetton_transfer.sender;
         const decimals = action.jetton_transfer.jetton?.decimals ?? 0;
         return [
           {
-            actionId: action.action_id ?? `${action.type}-${sender}-${recipient}-${action.jetton_transfer.amount ?? "0"}`,
+            actionId: `${eventId}:${actionIndex}`,
             type: "JETTON",
             direction,
             amount: toJetton(action.jetton_transfer.amount, decimals),
@@ -190,12 +225,12 @@ const normalizeActions = (actions: TonApiAction[], trackedAddress: string): Norm
       if (action.type === "NftTransfer" && action.nft_transfer) {
         const sender = action.nft_transfer.sender?.address;
         const recipient = action.nft_transfer.recipient?.address;
-        if (sender !== trackedAddress && recipient !== trackedAddress) return [];
-        const direction = sender === trackedAddress ? "OUT" : "IN";
-        const counterparty = sender === trackedAddress ? action.nft_transfer.recipient : action.nft_transfer.sender;
+        if (sender !== trackedRawAddress && recipient !== trackedRawAddress) return [];
+        const direction = sender === trackedRawAddress ? "OUT" : "IN";
+        const counterparty = sender === trackedRawAddress ? action.nft_transfer.recipient : action.nft_transfer.sender;
         return [
           {
-            actionId: action.action_id ?? `${action.type}-${sender}-${recipient}-${action.nft_transfer.nft?.name ?? "NFT"}`,
+            actionId: `${eventId}:${actionIndex}`,
             type: "NFT",
             direction,
             asset: "NFT",
@@ -278,6 +313,7 @@ async function processWallet(wallet: { id: string; address: string; name: string
   const user = await prisma.user.findUnique({ where: { id: wallet.userId } });
   if (!user) return;
   const lang = (user.language as Language) ?? DEFAULT_LANGUAGE;
+  const walletRaw = Address.parse(wallet.address).toRawString();
 
   let events: TonApiEvent[] = [];
   try {
@@ -336,7 +372,8 @@ async function processWallet(wallet: { id: string; address: string; name: string
     }
     newCount += 1;
     const actionTypes = event.actions.map((action) => action.type);
-    const normalized = normalizeActions(event.actions, wallet.address);
+    const txHash = event.base_transactions?.[0] ?? event.event_id;
+    const normalized = normalizeActions(event.actions, wallet.address, walletRaw, event.event_id);
     normalizedCountTotal += normalized.length;
     logger.info(
       { txHash: event.event_id, lt: eventLtRaw, actionTypes, normalizedCount: normalized.length },
@@ -356,14 +393,14 @@ async function processWallet(wallet: { id: string; address: string; name: string
         await prisma.walletEvent.create({
           data: {
             walletId: wallet.id,
-            txHash: event.event_id,
+            txHash,
             actionId: action.actionId,
             type: action.type,
             direction: action.direction,
             asset: action.asset,
             amount: action.amount ?? null,
             counterparty: action.counterparty?.address ?? action.counterparty?.name ?? null,
-            metadata: { action, event: { id: event.event_id, lt: eventLtRaw } }
+            metadata: { action, event: { id: event.event_id, lt: eventLtRaw, txHash } }
           }
         });
         createdActions.push(action);
@@ -388,17 +425,17 @@ async function processWallet(wallet: { id: string; address: string; name: string
     }
 
     if (createdActions.length > 0) {
-      const message = formatMessage(wallet.name, event.event_id, createdActions, lang);
+      const message = formatMessage(wallet.name, txHash, createdActions, lang);
       try {
         await bot.telegram.sendMessage(Number(user.telegramId), message, { parse_mode: "HTML" });
         notifiedCount += 1;
         logger.info(
-          { chatId: Number(user.telegramId), walletId: wallet.id, txHash: event.event_id },
+          { chatId: Number(user.telegramId), walletId: wallet.id, txHash },
           "telegram notification sent"
         );
       } catch (error) {
         logger.error(
-          { error, chatId: Number(user.telegramId), walletId: wallet.id, txHash: event.event_id },
+          { error, chatId: Number(user.telegramId), walletId: wallet.id, txHash },
           "failed to send telegram notification"
         );
       }
@@ -422,7 +459,7 @@ async function processWallet(wallet: { id: string; address: string; name: string
     "wallet processing summary"
   );
 
-  if (cursorBefore === null ? newCount > 0 : insertedCount > 0) {
+  if (cursorBefore === null ? newCount > 0 : normalizedCountTotal > 0 && insertedCount > 0) {
     await prisma.wallet.update({ where: { id: wallet.id }, data: { lastEventLt: maxLt.toString() } });
   }
 }
