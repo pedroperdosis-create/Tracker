@@ -520,20 +520,15 @@ const processEventsForWallet = async (
         ? formatSwapMessage(wallet.name, wallet.address, messageTxHash, swapSummary, lang)
         : formatMessage(wallet.name, wallet.address, messageTxHash, createdActions, lang);
       try {
-        await bot.telegram.sendMessage(Number(user.telegramId), message, {
+        const chatId = user.telegramId.toString();
+        await bot.telegram.sendMessage(chatId, message, {
           parse_mode: "HTML",
-          disable_web_page_preview: true
+          link_preview_options: { is_disabled: true }
         });
-        logger.info(
-          { chatId: Number(user.telegramId), walletId: wallet.id, txHash: messageTxHash },
-          "notification sent"
-        );
+        logger.info({ chatId, walletId: wallet.id, txHash: messageTxHash }, "notification sent");
         notifiedCount += 1;
       } catch (error) {
-        logger.warn(
-          { error, chatId: Number(user.telegramId), walletId: wallet.id, txHash: messageTxHash },
-          "notification failed"
-        );
+        logger.warn({ error, chatId: user.telegramId.toString(), walletId: wallet.id, txHash: messageTxHash }, "notification failed");
       }
     }
 
@@ -733,18 +728,16 @@ async function processWallet(wallet: ProcessWalletInput): Promise<ProcessWalletR
         ? formatSwapMessage(wallet.name, wallet.address, messageTxHash, swapSummary, lang)
         : formatMessage(wallet.name, wallet.address, messageTxHash, createdActions, lang);
       try {
-        await bot.telegram.sendMessage(Number(user.telegramId), message, {
+        const chatId = user.telegramId.toString();
+        await bot.telegram.sendMessage(chatId, message, {
           parse_mode: "HTML",
           link_preview_options: { is_disabled: true }
         });
         notifiedCount += 1;
-        logger.info(
-          { chatId: Number(user.telegramId), walletId: wallet.id, txHash: messageTxHash },
-          "telegram notification sent"
-        );
+        logger.info({ chatId, walletId: wallet.id, txHash: messageTxHash }, "telegram notification sent");
       } catch (error) {
         logger.error(
-          { error, chatId: Number(user.telegramId), walletId: wallet.id, txHash: messageTxHash },
+          { error, chatId: user.telegramId.toString(), walletId: wallet.id, txHash: messageTxHash },
           "failed to send telegram notification"
         );
       }
@@ -1003,7 +996,7 @@ let walletLookupUpdatedAt = 0;
 const refreshWalletLookup = async () => {
   const now = Date.now();
   if (now - walletLookupUpdatedAt < 30_000 && cachedWalletLookup.size > 0) {
-    return Array.from(new Map(cachedWalletLookup.values().map((wallet) => [wallet.id, wallet])).values());
+    return Array.from(new Map(Array.from(cachedWalletLookup.values()).map((wallet) => [wallet.id, wallet])).values());
   }
   const wallets = await prisma.wallet.findMany();
   cachedWalletLookup = await resolveWalletLookup(wallets);
@@ -1267,7 +1260,7 @@ async function start() {
       async () => {
         await refreshWalletLookup();
         wsWalletLookup = cachedWalletLookup;
-        return Array.from(new Map(cachedWalletLookup.values().map((wallet) => [wallet.id, wallet])).values());
+        return Array.from(new Map(Array.from(cachedWalletLookup.values()).map((wallet) => [wallet.id, wallet])).values());
       },
       () => wsWalletLookup
     );
