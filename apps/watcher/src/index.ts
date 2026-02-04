@@ -127,7 +127,7 @@ const normalizeActions = (actions: TonApiAction[], trackedAddress: string): Norm
   return actions
     .filter((action) => action.status !== "failed")
     .filter((action) => !shouldSkipAction(action))
-    .flatMap((action) => {
+    .flatMap<NormalizedAction>((action): NormalizedAction[] => {
       const note = hasMaestroNote(action) ? "maestro" : undefined;
       if (action.type === "TonTransfer" && action.ton_transfer) {
         const sender = action.ton_transfer.sender?.address;
@@ -302,7 +302,7 @@ async function processWallet(wallet: { id: string; address: string; name: string
 
     if (createdActions.length > 0) {
       const message = formatMessage(wallet.name, event.event_id, createdActions, lang);
-      await bot.telegram.sendMessage(Number(user.telegramId), message, { parse_mode: "HTML", disable_web_page_preview: true });
+      await bot.telegram.sendMessage(Number(user.telegramId), message, { parse_mode: "HTML" });
     }
 
     maxLt = eventLt > maxLt ? eventLt : maxLt;
