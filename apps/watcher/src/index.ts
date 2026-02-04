@@ -117,6 +117,11 @@ type NormalizedAction = {
   raw?: TonApiAction;
 };
 
+type ActionEntry = {
+  action: TonApiAction;
+  index: number;
+};
+
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const toTon = (amount?: string) => {
@@ -176,16 +181,19 @@ const shouldSkipAction = (action: TonApiAction) => {
   return false;
 };
 
+const getJettonTransfer = (action: TonApiAction) =>
+  action.jetton_transfer ?? action.jettonTransfer ?? action.JettonTransfer;
+
 const normalizeActions = (
-  actions: TonApiAction[],
+  entries: ActionEntry[],
   trackedAddress: string,
   trackedRawAddress: string,
   eventId: string
 ): NormalizedAction[] => {
-  return actions
-    .filter((action) => action.status !== "failed")
-    .filter((action) => !shouldSkipAction(action))
-    .flatMap<NormalizedAction>((action, actionIndex): NormalizedAction[] => {
+  return entries
+    .filter(({ action }) => action.status !== "failed")
+    .filter(({ action }) => !shouldSkipAction(action))
+    .flatMap<NormalizedAction>(({ action, index }): NormalizedAction[] => {
       const note = hasMaestroNote(action) ? "maestro" : undefined;
       const tonTransfer = action.ton_transfer ?? action.tonTransfer ?? action.TonTransfer;
       // TON transfer normalization is considered stable; do not modify without regression verification.
@@ -208,7 +216,7 @@ const normalizeActions = (
         );
         return [
           {
-            actionId: `${eventId}:${actionIndex}`,
+            actionId: `${eventId}:${index}`,
             type: "TON",
             direction,
             amount: toTon(tonTransfer.amount),
@@ -220,8 +228,9 @@ const normalizeActions = (
           }
         ];
       }
-      const jettonTransfer = action.jetton_transfer ?? action.jettonTransfer ?? action.JettonTransfer;
+      const jettonTransfer = getJettonTransfer(action);
       if (action.type === "JettonTransfer" && jettonTransfer) {
+        if (action.status && action.status !== "ok") return [];
         const sender = jettonTransfer.sender?.address;
         const recipient = jettonTransfer.recipient?.address;
         if (sender !== trackedRawAddress && recipient !== trackedRawAddress) return [];
@@ -234,7 +243,7 @@ const normalizeActions = (
         const asset = jettonTransfer.jetton?.symbol ?? jettonTransfer.jetton?.address ?? "JETTON";
         return [
           {
-            actionId: `${eventId}:${actionIndex}`,
+            actionId: `${eventId}:${index}`,
             type: "JETTON",
             direction,
             amount,
@@ -254,7 +263,7 @@ const normalizeActions = (
         const counterparty = sender === trackedRawAddress ? action.nft_transfer.recipient : action.nft_transfer.sender;
         return [
           {
-            actionId: `${eventId}:${actionIndex}`,
+            actionId: `${eventId}:${index}`,
             type: "NFT",
             direction,
             asset: "NFT",
@@ -400,7 +409,20 @@ async function processWallet(wallet: { id: string; address: string; name: string
     newCount += 1;
     const actionTypes = event.actions.map((action) => action.type);
     const tonTxHash = event.base_transactions?.[0] ?? event.event_id;
-    const normalized = normalizeActions(event.actions, wallet.address, walletRaw, event.event_id);
+    const actionEntries = event.actions.map((action, index) => ({ action, index }));
+    const hasJettonTransferForWallet = actionEntries.some(({ action }) => {
+      if (action.type !== "JettonTransfer") return false;
+      const transfer = getJettonTransfer(action);
+      if (!transfer) return false;
+      if (action.status && action.status !== "ok") return false;
+      const sender = transfer.sender?.address;
+      const recipient = transfer.recipient?.address;
+      return sender === walletRaw || recipient === walletRaw;
+    });
+    const entriesForNormalization = hasJettonTransferForWallet
+      ? actionEntries.filter(({ action }) => action.type === "JettonTransfer")
+      : actionEntries;
+    const normalized = normalizeActions(entriesForNormalization, wallet.address, walletRaw, event.event_id);
     normalizedCountTotal += normalized.length;
     logger.info(
       { txHash: event.event_id, lt: eventLtRaw, actionTypes, normalizedCount: normalized.length },
@@ -436,20 +458,14 @@ async function processWallet(wallet: { id: string; address: string; name: string
                   ? {
                       symbol: action.asset,
                       decimals:
-                        action.raw?.jetton_transfer?.jetton?.decimals ??
-                        action.raw?.jettonTransfer?.jetton?.decimals ??
-                        action.raw?.JettonTransfer?.jetton?.decimals ??
+                        getJettonTransfer((action.raw ?? {}) as TonApiAction)?.jetton?.decimals ??
                         null,
                       rawAmount:
-                        action.raw?.jetton_transfer?.amount ??
-                        action.raw?.jettonTransfer?.amount ??
-                        action.raw?.JettonTransfer?.amount ??
-                        null,
+                        getJettonTransfer((action.raw ?? {}) as TonApiAction)?.amount ?? null,
                       address:
-                        action.raw?.jetton_transfer?.jetton?.address ??
-                        action.raw?.jettonTransfer?.jetton?.address ??
-                        action.raw?.JettonTransfer?.jetton?.address ??
-                        null
+                        getJettonTransfer((action.raw ?? {}) as TonApiAction)?.jetton?.address ??
+                        null,
+                      originalAction: action.raw ?? null
                     }
                   : null
             }
@@ -458,6 +474,7 @@ async function processWallet(wallet: { id: string; address: string; name: string
         createdActions.push(action);
         insertedCount += 1;
         if (action.type === "JETTON") {
+          const transfer = getJettonTransfer((action.raw ?? {}) as TonApiAction);
           logger.info(
             {
               walletId: wallet.id,
@@ -465,18 +482,10 @@ async function processWallet(wallet: { id: string; address: string; name: string
               symbol: action.asset,
               direction: action.direction,
               humanAmount: action.amount ?? "0",
-              rawAmount:
-                action.raw?.jetton_transfer?.amount ??
-                action.raw?.jettonTransfer?.amount ??
-                action.raw?.JettonTransfer?.amount ??
-                null,
-              decimals:
-                action.raw?.jetton_transfer?.jetton?.decimals ??
-                action.raw?.jettonTransfer?.jetton?.decimals ??
-                action.raw?.JettonTransfer?.jetton?.decimals ??
-                null
+              rawAmount: transfer?.amount ?? null,
+              decimals: transfer?.jetton?.decimals ?? null
             },
-            "jetton transfer stored"
+            "Jetton processed"
           );
         }
       } catch (error) {
