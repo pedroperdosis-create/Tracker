@@ -10,6 +10,7 @@ import {
   getJettonTransfer,
   getTonTransfer
 } from "./swap";
+import { TonApiLimiter } from "./tonapi";
 import { prisma } from "./prisma";
 import {
   DEFAULT_LANGUAGE,
@@ -38,6 +39,15 @@ const BASE_POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? (FAST_MODE 
 const FAST_POLL_INTERVAL_MS = Number(process.env.FAST_POLL_INTERVAL_MS ?? (FAST_MODE ? 1500 : 3000));
 const MAX_BACKOFF_MS = Number(process.env.MAX_POLL_BACKOFF_MS ?? 60000);
 const MAX_PARALLEL_WALLETS = Number(process.env.MAX_PARALLEL_WALLETS ?? 3);
+const TONAPI_RPS = Number(process.env.TONAPI_RPS ?? 2);
+const TONAPI_BURST = Number(process.env.TONAPI_BURST ?? 2);
+const TONAPI_CONCURRENCY = Number(process.env.TONAPI_CONCURRENCY ?? 1);
+
+const tonapiLimiter = new TonApiLimiter({
+  rps: TONAPI_RPS,
+  burst: TONAPI_BURST,
+  concurrency: TONAPI_CONCURRENCY
+});
 
 const bot = new Telegraf(BOT_TOKEN);
 
@@ -309,15 +319,17 @@ async function fetchEvents(address: string, lastLt?: string): Promise<TonApiEven
   if (TONAPI_KEY) {
     headers.Authorization = `Bearer ${TONAPI_KEY}`;
   }
-  const response = await fetch(url, { headers });
+  const response = await tonapiLimiter.schedule(() => fetch(url, { headers }));
   if (!response.ok) {
     const bodyText = await response.text();
+    tonapiLimiter.markResponse(response.status);
     logger.warn(
       { status: response.status, address, body: bodyText.slice(0, 200) },
       "tonapi request failed"
     );
     throw new Error(`TonAPI error ${response.status}`);
   }
+  tonapiLimiter.markResponse(response.status);
   const data = (await response.json()) as { events?: TonApiEvent[] };
   return data.events ?? [];
 }
@@ -546,6 +558,7 @@ async function poll() {
     return { walletsCount: 0, newEvents: 0, notified: 0 };
   }
   logger.info({ count: wallets.length, sample }, "poll tick");
+  tonapiLimiter.logIfNeeded(logger);
   let newEvents = 0;
   let notified = 0;
   for (let i = 0; i < wallets.length; i += MAX_PARALLEL_WALLETS) {
@@ -581,82 +594,6 @@ async function start() {
     const wait = Math.max(nextInterval + backoffMs - elapsed + jitter(), 1000);
     await sleep(wait);
   }
-}
-
-const runSwapTests = () => {
-  const walletRaw = "0:wallet";
-  const entries: ActionEntry[] = [
-    {
-      index: 0,
-      action: {
-        type: "JettonTransfer",
-        status: "ok",
-        JettonTransfer: {
-          amount: "30000000",
-          jetton: { symbol: "TEST", decimals: 6 },
-          sender: { address: "0:other" },
-          recipient: { address: walletRaw }
-        }
-      }
-    },
-    {
-      index: 1,
-      action: {
-        type: "TonTransfer",
-        status: "ok",
-        TonTransfer: {
-          amount: "1000000000",
-          sender: { address: walletRaw },
-          recipient: { address: "0:router" }
-        }
-      }
-    },
-    {
-      index: 2,
-      action: {
-        type: "TonTransfer",
-        status: "ok",
-        TonTransfer: {
-          amount: "10000000",
-          sender: { address: walletRaw },
-          recipient: { address: "0:fee" }
-        }
-      }
-    }
-  ];
-  const summary = buildSwapSummary(entries, walletRaw);
-  if (!summary?.tokenBought || summary.tokenBought.amount !== "30" || summary.quote?.amount !== "1.01") {
-    throw new Error("SwapSummary test failed for ton/jetton netting.");
-  }
-
-  const fallbackSummary = buildSwapSummary(
-    [
-      {
-        index: 0,
-        action: {
-          type: "JettonTransfer",
-          status: "ok",
-          JettonTransfer: {
-            amount: "1000",
-            jetton: { symbol: "TEST", decimals: 0 },
-            sender: { address: "0:other" },
-            recipient: { address: walletRaw }
-          }
-        }
-      }
-    ],
-    walletRaw
-  );
-  if (fallbackSummary !== null) {
-    throw new Error("SwapSummary fallback test failed.");
-  }
-
-  logger.info("swap summary tests passed");
-};
-
-if (process.env.RUN_SWAP_TESTS === "1") {
-  runSwapTests();
-  process.exit(0);
 }
 
 start().catch((error) => {

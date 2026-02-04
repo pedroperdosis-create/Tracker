@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { buildSwapSummary } from "../dist/swap.js";
+import { buildSwapSummary } from "../src/swap.js";
 
 test("SwapSummary: jetton OUT + TON IN => swap", () => {
   const walletRaw = "0:wallet";
@@ -53,6 +53,27 @@ test("SwapSummary: simple USDT transfer is not swap", () => {
           jetton: { symbol: "USD₮", decimals: 6 },
           sender: { address: "0:other" },
           recipient: { address: walletRaw }
+        }
+      }
+    }
+  ];
+  const summary = buildSwapSummary(entries, walletRaw);
+  assert.equal(summary, null);
+});
+
+test("SwapSummary: one-sided pseudo swap is not swap", () => {
+  const walletRaw = "0:wallet";
+  const entries = [
+    {
+      index: 0,
+      action: {
+        type: "JettonTransfer",
+        status: "ok",
+        JettonTransfer: {
+          amount: "1000000",
+          jetton: { symbol: "AAA", decimals: 6 },
+          sender: { address: walletRaw },
+          recipient: { address: "0:router" }
         }
       }
     }

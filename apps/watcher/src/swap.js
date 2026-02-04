@@ -1,89 +1,12 @@
-export type TonApiAction = {
-  action_id?: string;
-  type: string;
-  status?: string;
-  simple_preview?: {
-    name?: string;
-    description?: string;
-    value_usd?: number;
-  };
-  ton_transfer?: {
-    amount?: string;
-    sender?: { address?: string; name?: string };
-    recipient?: { address?: string; name?: string };
-    is_internal?: boolean;
-    comment?: string;
-    amount_usd?: number;
-  };
-  tonTransfer?: {
-    amount?: string;
-    sender?: { address?: string; name?: string };
-    recipient?: { address?: string; name?: string };
-    is_internal?: boolean;
-    comment?: string;
-    amount_usd?: number;
-  };
-  TonTransfer?: {
-    amount?: string;
-    sender?: { address?: string; name?: string };
-    recipient?: { address?: string; name?: string };
-    is_internal?: boolean;
-    comment?: string;
-    amount_usd?: number;
-  };
-  jetton_transfer?: {
-    amount?: string;
-    jetton?: { symbol?: string; decimals?: number; address?: string };
-    sender?: { address?: string; name?: string };
-    recipient?: { address?: string; name?: string };
-    amount_usd?: number;
-  };
-  jettonTransfer?: {
-    amount?: string;
-    jetton?: { symbol?: string; decimals?: number; address?: string };
-    sender?: { address?: string; name?: string };
-    recipient?: { address?: string; name?: string };
-    amount_usd?: number;
-  };
-  JettonTransfer?: {
-    amount?: string;
-    jetton?: { symbol?: string; decimals?: number; address?: string };
-    sender?: { address?: string; name?: string };
-    recipient?: { address?: string; name?: string };
-    amount_usd?: number;
-  };
-  nft_transfer?: {
-    sender?: { address?: string; name?: string };
-    recipient?: { address?: string; name?: string };
-    nft?: { name?: string; collection?: { name?: string } };
-  };
-};
-
-export type ActionEntry = {
-  action: TonApiAction;
-  index: number;
-};
-
-export type SwapToken = {
-  asset: string;
-  amount: string;
-};
-
-export type SwapSummary = {
-  tokenBought?: SwapToken;
-  tokenSold?: SwapToken;
-  quote?: SwapToken;
-};
-
-export const getJettonTransfer = (action: TonApiAction) =>
+export const getJettonTransfer = (action) =>
   action.jetton_transfer ?? action.jettonTransfer ?? action.JettonTransfer;
 
-export const getTonTransfer = (action: TonApiAction) =>
+export const getTonTransfer = (action) =>
   action.ton_transfer ?? action.tonTransfer ?? action.TonTransfer;
 
-export const isUsdJetton = (symbol?: string) => (symbol ?? "").toLowerCase().includes("usd");
+export const isUsdJetton = (symbol) => (symbol ?? "").toLowerCase().includes("usd");
 
-const toJetton = (amount: string, decimals: number) => {
+const toJetton = (amount, decimals) => {
   const base = BigInt(amount);
   const divisor = BigInt(10) ** BigInt(decimals);
   const whole = base / divisor;
@@ -92,7 +15,7 @@ const toJetton = (amount: string, decimals: number) => {
   return fracStr ? `${whole}.${fracStr}` : `${whole}`;
 };
 
-const toTon = (amount: string) => {
+const toTon = (amount) => {
   const nano = BigInt(amount);
   const whole = nano / 1_000_000_000n;
   const fraction = nano % 1_000_000_000n;
@@ -100,7 +23,7 @@ const toTon = (amount: string) => {
   return fracStr ? `${whole}.${fracStr}` : `${whole}`;
 };
 
-export const buildSwapSummary = (entries: ActionEntry[], trackedRawAddress: string): SwapSummary | null => {
+export const buildSwapSummary = (entries, trackedRawAddress) => {
   const jettonEntries = entries.filter(({ action }) => action.type === "JettonTransfer" && getJettonTransfer(action));
   const tonEntries = entries.filter(({ action }) => action.type === "TonTransfer" && getTonTransfer(action));
 
@@ -108,10 +31,9 @@ export const buildSwapSummary = (entries: ActionEntry[], trackedRawAddress: stri
     return null;
   }
 
-  let tokenBought: SwapToken | undefined;
-  let tokenSold: SwapToken | undefined;
-
-  let netUsdJetton: { amount: bigint; symbol?: string } | null = null;
+  let tokenBought;
+  let tokenSold;
+  let netUsdJetton = null;
 
   for (const { action } of jettonEntries) {
     if (action.status && action.status !== "ok") continue;
@@ -147,8 +69,7 @@ export const buildSwapSummary = (entries: ActionEntry[], trackedRawAddress: stri
     return null;
   }
 
-  let quote: SwapToken | undefined;
-
+  let quote;
   if (tonEntries.length > 0) {
     let netTon = 0n;
     for (const { action } of tonEntries) {
@@ -178,8 +99,7 @@ export const buildSwapSummary = (entries: ActionEntry[], trackedRawAddress: stri
 
   const hasBothJettonSides = tokenBought && tokenSold && tokenBought.asset !== tokenSold.asset;
   const hasJettonAndQuote = (tokenBought || tokenSold) && quote;
-  const isSameAssetQuote =
-    quote && (tokenBought?.asset === quote.asset || tokenSold?.asset === quote.asset);
+  const isSameAssetQuote = quote && (tokenBought?.asset === quote.asset || tokenSold?.asset === quote.asset);
 
   if (!hasBothJettonSides && (!hasJettonAndQuote || isSameAssetQuote)) {
     return null;
