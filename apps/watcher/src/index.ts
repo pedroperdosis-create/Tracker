@@ -12,6 +12,7 @@ import {
   getTonTransfer
 } from "./swap";
 import { createEmptyProcessResult } from "./process-result";
+import type { ProcessWalletResult } from "./process-result";
 import { TonApiError, TonApiLimiter } from "./tonapi";
 import { prisma } from "./prisma";
 import {
@@ -344,8 +345,6 @@ async function fetchEvents(address: string, lastLt?: string): Promise<TonApiEven
   const data = (await response.json()) as { events?: TonApiEvent[] };
   return data.events ?? [];
 }
-
-import type { ProcessWalletResult } from "./process-result";
 
 async function processWallet(
   wallet: { id: string; address: string; name: string; lastEventLt: string | null; userId: string }
