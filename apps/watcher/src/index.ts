@@ -1,7 +1,7 @@
 import "dotenv/config";
+import express, { type Request, type Response } from "express";
 import pino from "pino";
 import { Telegraf } from "telegraf";
-import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import { Address } from "@ton/core";
 import WebSocket, { type RawData } from "ws";
 import {
@@ -29,6 +29,7 @@ import {
   t
 } from "@tracker/common";
 import { Prisma, type Wallet as PrismaWallet } from "@prisma/client";
+import { extractWebhookHint, type WebhookPayload } from "./webhook-payload";
 
 const logger = pino({ name: "watcher" });
 
@@ -62,6 +63,7 @@ const WEBHOOK_PORT = Number(process.env.WEBHOOK_PORT ?? 8080);
 const TONAPI_WEBHOOK_TOKEN = process.env.TONAPI_WEBHOOK_TOKEN;
 const TONAPI_WEBHOOK_ENDPOINT = process.env.TONAPI_WEBHOOK_ENDPOINT;
 const TONAPI_WEBHOOK_ID = process.env.TONAPI_WEBHOOK_ID;
+const TONAPI_WEBHOOK_SECRET = process.env.TONAPI_WEBHOOK_SECRET;
 const WEBHOOK_MODE = Boolean(TONAPI_WEBHOOK_TOKEN && TONAPI_WEBHOOK_ENDPOINT);
 const FAST_POLLING_ENABLED = FAST_MODE && !WEBHOOK_MODE;
 
@@ -502,10 +504,10 @@ const processEventsForWallet = async (
           );
         }
       } catch (error) {
-        const err = normalizeError(error);
-        if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+        if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
           continue;
         }
+        const err = normalizeError(error);
         insertErrorsCount += 1;
         logger.error(
           {
@@ -711,10 +713,10 @@ async function processWallet(wallet: ProcessWalletInput): Promise<ProcessWalletR
           );
         }
       } catch (error) {
-        const err = normalizeError(error);
-        if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+        if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
           continue;
         }
+        const err = normalizeError(error);
         insertErrorsCount += 1;
         logger.error(
           {
@@ -832,15 +834,10 @@ const buildWsUrl = () => {
   }
 };
 
-type WebhookPayload = {
-  account_id?: string;
-  lt?: string;
-  tx_hash?: string;
-};
-
 type WebhookQueueItem = {
   payload: WebhookPayload;
   receivedAt: number;
+  hint: ReturnType<typeof extractWebhookHint>;
 };
 
 const createWebhookQueue = (handler: (item: WebhookQueueItem) => Promise<void>) => {
@@ -865,8 +862,9 @@ const createWebhookQueue = (handler: (item: WebhookQueueItem) => Promise<void>) 
 
   return {
     enqueue: (payload: WebhookPayload) => {
-      const key = payload.tx_hash ?? `${payload.account_id ?? "unknown"}:${payload.lt ?? "unknown"}`;
-      pending.set(key, { payload, receivedAt: Date.now() });
+      const hint = extractWebhookHint(payload);
+      const key = hint.txHash ?? `${hint.accountId ?? "unknown"}:${hint.eventId ?? "unknown"}`;
+      pending.set(key, { payload, receivedAt: Date.now(), hint });
       run(key);
     }
   };
@@ -893,37 +891,44 @@ const fetchWebhookEvents = async (accountId: string, lt?: string, txHash?: strin
   );
 };
 
+const extractWebhookLt = (payload: WebhookPayload): string | undefined => {
+  const directLt = payload.lt;
+  if (typeof directLt === "string") return directLt;
+  const params = payload.params;
+  if (params && typeof params === "object" && typeof (params as Record<string, unknown>).lt === "string") {
+    return (params as Record<string, string>).lt;
+  }
+  return undefined;
+};
+
 const userToNotifierUser = (user: { telegramId: bigint }): NotifierUser => ({
   telegramId: user.telegramId.toString()
 });
 
 const startWebhookServer = (queue: ReturnType<typeof createWebhookQueue>) => {
-  const server = http.createServer((req: IncomingMessage, res: ServerResponse) => {
-    if (req.method !== "POST" || req.url !== "/tonapi/webhook") {
-      res.statusCode = 404;
-      res.end();
-      return;
-    }
-    let body = "";
-    req.on("data", (chunk: Buffer) => {
-      body += chunk.toString("utf8");
-    });
-    req.on("end", () => {
-      res.statusCode = 200;
-      res.end("ok");
-      try {
-        const payload = JSON.parse(body) as WebhookPayload;
-        logger.info(
-          { accountId: payload.account_id ?? null, lt: payload.lt ?? null, txHash: payload.tx_hash ?? null },
-          "webhook received"
-        );
-        queue.enqueue(payload);
-      } catch (error) {
-        logger.warn({ error }, "webhook parse failed");
-      }
-    });
+  const app = express();
+  app.use(express.json({ limit: "256kb" }));
+
+  app.get("/health", (_req: Request, res: Response) => {
+    res.status(200).send("ok");
   });
-  server.listen(WEBHOOK_PORT, () => {
+
+  app.post("/webhook/tonapi", (req: Request, res: Response) => {
+    if (TONAPI_WEBHOOK_SECRET) {
+      const headerSecret = req.header("x-tonapi-secret");
+      if (headerSecret !== TONAPI_WEBHOOK_SECRET) {
+        res.status(401).json({ ok: false });
+        return;
+      }
+    }
+    const payload = (req.body ?? {}) as WebhookPayload;
+    const hint = extractWebhookHint(payload);
+    res.status(200).json({ ok: true });
+    logger.info({ txHash: hint.txHash ?? null, accountId: hint.accountId ?? null, eventId: hint.eventId ?? null }, "webhook received");
+    queue.enqueue(payload);
+  });
+
+  app.listen(WEBHOOK_PORT, () => {
     logger.info({ port: WEBHOOK_PORT }, "webhook server listening");
   });
 };
@@ -1212,10 +1217,10 @@ async function start() {
   );
   let backoffMs = 0;
   let nextInterval = BASE_POLL_INTERVAL_MS;
-  const webhookQueue = createWebhookQueue(async ({ payload, receivedAt }) => {
-    const accountId = payload.account_id;
+  const webhookQueue = createWebhookQueue(async ({ payload, receivedAt, hint }) => {
+    const accountId = hint.accountId;
     if (!accountId) {
-      logger.warn({ payload }, "webhook payload missing account_id");
+      logger.warn({ txHash: hint.txHash ?? null, eventId: hint.eventId ?? null }, "webhook payload missing account_id");
       return;
     }
     const wallet = await getWalletFromLookup(accountId);
@@ -1228,7 +1233,7 @@ async function start() {
     const lang = (user.language as Language) ?? DEFAULT_LANGUAGE;
     let events: TonApiEvent[] = [];
     try {
-      events = await fetchWebhookEvents(accountId, payload.lt, payload.tx_hash);
+      events = await fetchWebhookEvents(accountId, extractWebhookLt(payload), hint.txHash);
     } catch (error) {
       logger.warn({ error, accountId }, "webhook fetch failed");
       return;
@@ -1238,8 +1243,8 @@ async function start() {
     logger.info(
       {
         accountId,
-        txHash: payload.tx_hash ?? null,
-        lt: payload.lt ?? null,
+        txHash: hint.txHash ?? null,
+        lt: extractWebhookLt(payload) ?? null,
         durationMs: Date.now() - receivedAt,
         newCount: result.newCount,
         notifiedCount: result.notifiedCount

@@ -57,6 +57,13 @@ docker compose logs -f bot
 - `TONAPI_KEY` — ключ TonAPI (опционально).
 - `TONAPI_BASE` — базовый URL TonAPI (по умолчанию https://tonapi.io/v2).
 - `POLL_INTERVAL_MS` — интервал опроса в мс (по умолчанию 12000).
+- `WEBHOOK_PORT` — порт webhook-сервера watcher (по умолчанию 8080).
+- `TONAPI_WEBHOOK_SECRET` — секрет заголовка `X-Tonapi-Secret` для `POST /webhook/tonapi`.
+
+## TonAPI Webhooks (дополнительно к polling)
+- Публичный endpoint: `https://tracker.utyashka.fun/webhook/tonapi`.
+- Для healthcheck доступен `GET /health`.
+- Рекомендуется проксировать публичный HTTPS на локальный `127.0.0.1:8080` (например, cloudflared/Nginx).
 
 ## Ссылки
 - Адреса: `https://tonviewer.com/<address>`
