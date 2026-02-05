@@ -28,8 +28,9 @@ import {
   txLink,
   t
 } from "@tracker/common";
-import { Prisma, type Wallet as PrismaWallet } from "@prisma/client";
+import { type Wallet as PrismaWallet } from "@prisma/client";
 import { extractWebhookHint, type WebhookPayload } from "./webhook-payload";
+import { diffAccountSubscriptions, splitIntoBatches } from "./webhook-sync";
 
 const logger = pino({ name: "watcher" });
 
@@ -60,11 +61,11 @@ const WS_MODE = process.env.WS_MODE === "1";
 const TONCENTER_WS_URL = process.env.TONCENTER_WS_URL;
 const TONCENTER_API_KEY = process.env.TONCENTER_API_KEY;
 const WEBHOOK_PORT = Number(process.env.WEBHOOK_PORT ?? 8080);
-const TONAPI_WEBHOOK_TOKEN = process.env.TONAPI_WEBHOOK_TOKEN;
-const TONAPI_WEBHOOK_ENDPOINT = process.env.TONAPI_WEBHOOK_ENDPOINT;
-const TONAPI_WEBHOOK_ID = process.env.TONAPI_WEBHOOK_ID;
 const TONAPI_WEBHOOK_SECRET = process.env.TONAPI_WEBHOOK_SECRET;
-const WEBHOOK_MODE = Boolean(TONAPI_WEBHOOK_TOKEN && TONAPI_WEBHOOK_ENDPOINT);
+const WEBHOOK_PUBLIC_URL = process.env.WEBHOOK_PUBLIC_URL;
+const WEBHOOK_SYNC_INTERVAL_MS = Number(process.env.WEBHOOK_SYNC_INTERVAL_MS ?? 30000);
+const WEBHOOK_SYNC_BATCH = Number(process.env.WEBHOOK_SYNC_BATCH ?? 50);
+const WEBHOOK_MODE = Boolean(WEBHOOK_PUBLIC_URL && TONAPI_KEY);
 const FAST_POLLING_ENABLED = FAST_MODE && !WEBHOOK_MODE;
 
 const walletSchedule = new Map<string, { nextPollAt: number; backoffMs: number }>();
@@ -137,6 +138,11 @@ const safeBigInt = (value?: string) => {
 };
 
 const normalizeError = (error: unknown) => (error instanceof Error ? error : new Error(String(error)));
+const isUniqueViolation = (error: unknown) => {
+  if (!error || typeof error !== "object") return false;
+  const code = (error as { code?: unknown }).code;
+  return code === "P2002";
+};
 
 const extractEventLt = (event: TonApiEvent): string | null => {
   const lt = event.lt ?? event.transaction?.lt;
@@ -504,7 +510,7 @@ const processEventsForWallet = async (
           );
         }
       } catch (error) {
-        if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
+        if (isUniqueViolation(error)) {
           continue;
         }
         const err = normalizeError(error);
@@ -713,7 +719,7 @@ async function processWallet(wallet: ProcessWalletInput): Promise<ProcessWalletR
           );
         }
       } catch (error) {
-        if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
+        if (isUniqueViolation(error)) {
           continue;
         }
         const err = normalizeError(error);
@@ -894,9 +900,12 @@ const fetchWebhookEvents = async (accountId: string, lt?: string, txHash?: strin
 const extractWebhookLt = (payload: WebhookPayload): string | undefined => {
   const directLt = payload.lt;
   if (typeof directLt === "string") return directLt;
+  if (typeof directLt === "number" && Number.isFinite(directLt)) return String(directLt);
   const params = payload.params;
-  if (params && typeof params === "object" && typeof (params as Record<string, unknown>).lt === "string") {
-    return (params as Record<string, string>).lt;
+  if (params && typeof params === "object") {
+    const value = (params as Record<string, unknown>).lt;
+    if (typeof value === "string") return value;
+    if (typeof value === "number" && Number.isFinite(value)) return String(value);
   }
   return undefined;
 };
@@ -933,78 +942,136 @@ const startWebhookServer = (queue: ReturnType<typeof createWebhookQueue>) => {
   });
 };
 
-const subscribeWebhookAccounts = async (webhookId: string, accounts: string[]) => {
-  if (!TONAPI_WEBHOOK_TOKEN) return;
-  const headers = {
-    Authorization: `Bearer ${TONAPI_WEBHOOK_TOKEN}`,
-    "Content-Type": "application/json"
-  };
-  const variants = [
-    { name: "account-tx", path: `/webhooks/${webhookId}/account-tx/subscribe`, key: "accounts" },
-    { name: "account-tx-ids", path: `/webhooks/${webhookId}/account-tx/subscribe`, key: "account_ids" },
-    { name: "accounts", path: `/webhooks/${webhookId}/accounts`, key: "accounts" }
-  ];
-  const batchSize = 50;
-  let subscribed = 0;
-  let failed = 0;
-  for (let i = 0; i < accounts.length; i += batchSize) {
-    const batch = accounts.slice(i, i + batchSize);
-    for (const variant of variants) {
-      try {
-        const response = await fetch(`https://rt.tonapi.io${variant.path}`, {
-          method: "POST",
-          headers,
-          body: JSON.stringify({ [variant.key]: batch })
-        });
-        if (response.ok) {
-          subscribed += batch.length;
-          logger.info({ count: batch.length, variant: variant.name }, "webhook accounts subscribed");
-          break;
-        }
-        if (response.status === 409) {
-          logger.info({ count: batch.length, variant: variant.name }, "webhook accounts already subscribed");
-          subscribed += batch.length;
-          break;
-        }
-        const body = await response.text();
-        logger.warn(
-          { status: response.status, body: body.slice(0, 200), variant: variant.name },
-          "webhook subscribe failed"
-        );
-        failed += batch.length;
-      } catch (error) {
-        logger.warn({ error, variant: variant.name }, "webhook subscribe error");
-        failed += batch.length;
-      }
-    }
-  }
-  logger.info({ subscribed, failed }, "webhook subscribe summary");
-};
+const rtHeaders = (): Record<string, string> => ({
+  Authorization: `Bearer ${TONAPI_KEY}`,
+  "Content-Type": "application/json"
+});
 
 const ensureWebhookId = async () => {
-  if (!TONAPI_WEBHOOK_TOKEN || !TONAPI_WEBHOOK_ENDPOINT) return null;
-  if (TONAPI_WEBHOOK_ID) return TONAPI_WEBHOOK_ID;
+  if (!WEBHOOK_MODE || !WEBHOOK_PUBLIC_URL) return null;
   try {
-    const response = await fetch("https://rt.tonapi.io/webhooks", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${TONAPI_WEBHOOK_TOKEN}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ endpoint: TONAPI_WEBHOOK_ENDPOINT })
+    const listResponse = await fetch("https://rt.tonapi.io/webhooks", {
+      headers: { Authorization: `Bearer ${TONAPI_KEY}` }
     });
-    const payload = (await response.json()) as { webhook_id?: string; id?: string };
-    const webhookId = payload.webhook_id ?? payload.id ?? null;
-    if (webhookId) {
-      logger.info({ webhookId }, "webhook created; set TONAPI_WEBHOOK_ID in env");
-    } else {
-      logger.warn({ payload }, "webhook created but id missing");
+    if (!listResponse.ok) {
+      throw new Error(`list webhooks failed ${listResponse.status}`);
     }
+    const listPayload = (await listResponse.json()) as { webhooks?: Array<{ webhook_id?: string; endpoint?: string; id?: string }> };
+    const existing = (listPayload.webhooks ?? []).find((item) => item.endpoint === WEBHOOK_PUBLIC_URL);
+    if (existing) {
+      const webhookId = existing.webhook_id ?? existing.id ?? null;
+      logger.info({ webhookId }, "webhook ensured");
+      return webhookId;
+    }
+
+    const createResponse = await fetch("https://rt.tonapi.io/webhooks", {
+      method: "POST",
+      headers: rtHeaders(),
+      body: JSON.stringify({ endpoint: WEBHOOK_PUBLIC_URL })
+    });
+    if (!createResponse.ok) {
+      throw new Error(`create webhook failed ${createResponse.status}`);
+    }
+    const payload = (await createResponse.json()) as { webhook_id?: string; id?: string };
+    const webhookId = payload.webhook_id ?? payload.id ?? null;
+    logger.info({ webhookId }, "webhook ensured");
     return webhookId;
   } catch (error) {
-    logger.warn({ error }, "webhook create failed");
+    logger.warn({ error }, "webhook ensure failed");
     return null;
   }
+};
+
+const listRemoteSubscriptions = async (webhookId: string): Promise<string[]> => {
+  let offset = 0;
+  const limit = 1000;
+  const result: string[] = [];
+  while (true) {
+    const response = await fetch(
+      `https://rt.tonapi.io/webhooks/${webhookId}/account-tx/subscriptions?offset=${offset}&limit=${limit}`,
+      { headers: { Authorization: `Bearer ${TONAPI_KEY}` } }
+    );
+    if (!response.ok) {
+      throw new Error(`list subscriptions failed ${response.status}`);
+    }
+    const payload = (await response.json()) as {
+      subscriptions?: Array<{ account_id?: string } | string>;
+      accounts?: Array<{ account_id?: string } | string>;
+    };
+    const page = (payload.subscriptions ?? payload.accounts ?? []).flatMap((item) => {
+      if (typeof item === "string") return [item];
+      if (item && typeof item.account_id === "string") return [item.account_id];
+      return [];
+    });
+    result.push(...page);
+    if (page.length < limit) break;
+    offset += limit;
+  }
+  return result;
+};
+
+const syncWebhookSubscriptions = async (webhookId: string) => {
+  const startedAt = Date.now();
+  const wallets: Array<{ id: string; address: string }> = await prisma.wallet.findMany({ select: { id: true, address: true } });
+  const dbAccountIds = wallets.flatMap((wallet) => {
+    try {
+      return [Address.parse(wallet.address).toRawString()];
+    } catch {
+      logger.warn({ walletId: wallet.id, address: wallet.address }, "wallet address parse failed for webhook sync");
+      return [];
+    }
+  });
+
+  let subscribedCount = 0;
+  let unsubscribedCount = 0;
+  let errorsCount = 0;
+  try {
+    const remoteAccountIds = await listRemoteSubscriptions(webhookId);
+    const { toSubscribe, toUnsubscribe } = diffAccountSubscriptions(dbAccountIds, remoteAccountIds);
+
+    for (const batch of splitIntoBatches(toSubscribe, WEBHOOK_SYNC_BATCH)) {
+      if (batch.length === 0) continue;
+      const response = await fetch(`https://rt.tonapi.io/webhooks/${webhookId}/account-tx/subscribe`, {
+        method: "POST",
+        headers: rtHeaders(),
+        body: JSON.stringify({ accounts: batch.map((account_id) => ({ account_id })) })
+      });
+      if (!response.ok) {
+        errorsCount += batch.length;
+        logger.warn({ status: response.status, batch: batch.length }, "webhook subscribe batch failed");
+      } else {
+        subscribedCount += batch.length;
+      }
+    }
+
+    for (const batch of splitIntoBatches(toUnsubscribe, WEBHOOK_SYNC_BATCH)) {
+      if (batch.length === 0) continue;
+      const response = await fetch(`https://rt.tonapi.io/webhooks/${webhookId}/account-tx/unsubscribe`, {
+        method: "POST",
+        headers: rtHeaders(),
+        body: JSON.stringify({ accounts: batch })
+      });
+      if (!response.ok) {
+        errorsCount += batch.length;
+        logger.warn({ status: response.status, batch: batch.length }, "webhook unsubscribe batch failed");
+      } else {
+        unsubscribedCount += batch.length;
+      }
+    }
+  } catch (error) {
+    errorsCount += 1;
+    logger.warn({ error }, "webhook sync failed");
+  }
+
+  logger.info(
+    {
+      subscribedCount,
+      unsubscribedCount,
+      errorsCount,
+      durationMs: Date.now() - startedAt
+    },
+    "webhook sync summary"
+  );
 };
 
 let cachedWalletLookup = new Map<string, WsWallet>();
@@ -1211,7 +1278,7 @@ async function start() {
       wsMode: WS_MODE,
       toncenterWsConfigured: Boolean(TONCENTER_WS_URL),
       webhooksConfigured: WEBHOOK_MODE,
-      webhookId: TONAPI_WEBHOOK_ID ?? null
+      webhookPublicUrl: WEBHOOK_PUBLIC_URL ?? null
     },
     "watcher started"
   );
@@ -1260,17 +1327,12 @@ async function start() {
     if (!webhookId) {
       logger.warn("webhooks configured but webhook id could not be resolved");
     } else {
-      const wallets = await refreshWalletLookup();
-      const accountIds = wallets.flatMap((wallet) => {
-        try {
-          return [Address.parse(wallet.address).toRawString()];
-        } catch {
-          return [];
-        }
-      });
-      await subscribeWebhookAccounts(webhookId, accountIds);
+      await syncWebhookSubscriptions(webhookId);
+      setInterval(() => {
+        void syncWebhookSubscriptions(webhookId);
+      }, WEBHOOK_SYNC_INTERVAL_MS);
     }
-  } else if (TONAPI_WEBHOOK_TOKEN || TONAPI_WEBHOOK_ENDPOINT) {
+  } else if (WEBHOOK_PUBLIC_URL || TONAPI_KEY) {
     logger.warn("webhooks partially configured; polling fallback active");
   }
 
