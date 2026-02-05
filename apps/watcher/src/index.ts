@@ -1,7 +1,7 @@
 import "dotenv/config";
 import pino from "pino";
 import { Telegraf } from "telegraf";
-import http from "node:http";
+import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import { Address } from "@ton/core";
 import WebSocket, { type RawData } from "ws";
 import {
@@ -97,6 +97,10 @@ type NormalizedAction = {
   raw?: TonApiAction;
 };
 
+type NotifierUser = {
+  telegramId: string;
+};
+
 type ProcessWalletInput = Pick<PrismaWallet, "id" | "address" | "name" | "lastEventLt" | "userId">;
 type WsWallet = ProcessWalletInput;
 
@@ -129,6 +133,8 @@ const safeBigInt = (value?: string) => {
     return 0n;
   }
 };
+
+const normalizeError = (error: unknown) => (error instanceof Error ? error : new Error(String(error)));
 
 const extractEventLt = (event: TonApiEvent): string | null => {
   const lt = event.lt ?? event.transaction?.lt;
@@ -359,7 +365,7 @@ async function fetchEvents(address: string, lastLt?: string): Promise<TonApiEven
 const processEventsForWallet = async (
   wallet: ProcessWalletInput,
   events: TonApiEvent[],
-  user: { telegramId: string },
+  user: NotifierUser,
   lang: Language,
   source: "polling" | "webhook" | "ws"
 ): Promise<ProcessWalletResult> => {
@@ -496,17 +502,18 @@ const processEventsForWallet = async (
           );
         }
       } catch (error) {
-        if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
+        const err = normalizeError(error);
+        if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
           continue;
         }
         insertErrorsCount += 1;
         logger.error(
           {
-            error,
+            error: err,
             txHash: event.event_id,
             actionId: action.actionId,
             type: action.type,
-            stack: error instanceof Error ? error.stack?.split("\n").slice(0, 3).join("\n") : undefined
+            stack: err.stack?.split("\n").slice(0, 3).join("\n")
           },
           "failed to insert wallet event"
         );
@@ -704,17 +711,18 @@ async function processWallet(wallet: ProcessWalletInput): Promise<ProcessWalletR
           );
         }
       } catch (error) {
-        if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
+        const err = normalizeError(error);
+        if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
           continue;
         }
         insertErrorsCount += 1;
         logger.error(
           {
-            error,
+            error: err,
             txHash: event.event_id,
             actionId: action.actionId,
             type: action.type,
-            stack: error instanceof Error ? error.stack?.split("\n").slice(0, 3).join("\n") : undefined
+            stack: err.stack?.split("\n").slice(0, 3).join("\n")
           },
           "failed to insert wallet event"
         );
@@ -885,16 +893,20 @@ const fetchWebhookEvents = async (accountId: string, lt?: string, txHash?: strin
   );
 };
 
+const userToNotifierUser = (user: { telegramId: bigint }): NotifierUser => ({
+  telegramId: user.telegramId.toString()
+});
+
 const startWebhookServer = (queue: ReturnType<typeof createWebhookQueue>) => {
-  const server = http.createServer((req, res) => {
+  const server = http.createServer((req: IncomingMessage, res: ServerResponse) => {
     if (req.method !== "POST" || req.url !== "/tonapi/webhook") {
       res.statusCode = 404;
       res.end();
       return;
     }
     let body = "";
-    req.on("data", (chunk) => {
-      body += chunk.toString();
+    req.on("data", (chunk: Buffer) => {
+      body += chunk.toString("utf8");
     });
     req.on("end", () => {
       res.statusCode = 200;
@@ -993,12 +1005,14 @@ const ensureWebhookId = async () => {
 let cachedWalletLookup = new Map<string, WsWallet>();
 let walletLookupUpdatedAt = 0;
 
-const refreshWalletLookup = async () => {
+const refreshWalletLookup = async (): Promise<WsWallet[]> => {
   const now = Date.now();
   if (now - walletLookupUpdatedAt < 30_000 && cachedWalletLookup.size > 0) {
-    return Array.from(new Map(Array.from(cachedWalletLookup.values()).map((wallet) => [wallet.id, wallet])).values());
+    return Array.from(
+      new Map(Array.from(cachedWalletLookup.values()).map((wallet: WsWallet) => [wallet.id, wallet])).values()
+    );
   }
-  const wallets = await prisma.wallet.findMany();
+  const wallets: WsWallet[] = await prisma.wallet.findMany();
   cachedWalletLookup = await resolveWalletLookup(wallets);
   walletLookupUpdatedAt = now;
   return wallets;
@@ -1120,7 +1134,7 @@ const startWebSocket = (
 };
 
 async function poll() {
-  const wallets = await prisma.wallet.findMany();
+  const wallets: WsWallet[] = await prisma.wallet.findMany();
   const sample = wallets.slice(0, 2).map((wallet) => ({ id: wallet.id, address: wallet.address }));
   if (wallets.length === 0) {
     const now = Date.now();
@@ -1219,7 +1233,8 @@ async function start() {
       logger.warn({ error, accountId }, "webhook fetch failed");
       return;
     }
-    const result = await processEventsForWallet(wallet, events, user, lang, "webhook");
+    const notifierUser = userToNotifierUser(user);
+    const result = await processEventsForWallet(wallet, events, notifierUser, lang, "webhook");
     logger.info(
       {
         accountId,
@@ -1260,7 +1275,9 @@ async function start() {
       async () => {
         await refreshWalletLookup();
         wsWalletLookup = cachedWalletLookup;
-        return Array.from(new Map(Array.from(cachedWalletLookup.values()).map((wallet) => [wallet.id, wallet])).values());
+        return Array.from(
+          new Map(Array.from(cachedWalletLookup.values()).map((wallet: WsWallet) => [wallet.id, wallet])).values()
+        );
       },
       () => wsWalletLookup
     );
