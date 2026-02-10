@@ -1074,6 +1074,34 @@ const syncWebhookSubscriptions = async (webhookId: string) => {
   );
 };
 
+const createWebhookSyncRunner = (webhookId: string) => {
+  let inFlight = false;
+  let pending = false;
+
+  const run = async () => {
+    if (inFlight) {
+      pending = true;
+      return;
+    }
+    inFlight = true;
+    try {
+      await syncWebhookSubscriptions(webhookId);
+    } finally {
+      inFlight = false;
+      if (pending) {
+        pending = false;
+        await run();
+      }
+    }
+  };
+
+  return {
+    schedule: () => {
+      void run();
+    }
+  };
+};
+
 let cachedWalletLookup = new Map<string, WsWallet>();
 let walletLookupUpdatedAt = 0;
 
@@ -1327,9 +1355,10 @@ async function start() {
     if (!webhookId) {
       logger.warn("webhooks configured but webhook id could not be resolved");
     } else {
-      await syncWebhookSubscriptions(webhookId);
+      const syncRunner = createWebhookSyncRunner(webhookId);
+      syncRunner.schedule();
       setInterval(() => {
-        void syncWebhookSubscriptions(webhookId);
+        syncRunner.schedule();
       }, WEBHOOK_SYNC_INTERVAL_MS);
     }
   } else if (WEBHOOK_PUBLIC_URL || TONAPI_KEY) {

@@ -17,3 +17,11 @@ test("splitIntoBatches chunks by fixed size", () => {
     [5]
   ]);
 });
+
+test("diffAccountSubscriptions keeps shared address when one user deleted", () => {
+  const dbWithSharedAddress = ["0:shared", "0:shared", "0:other"];
+  const remote = ["0:shared", "0:old"];
+  const diff = diffAccountSubscriptions(dbWithSharedAddress, remote);
+  assert.deepEqual(diff.toSubscribe, ["0:other"]);
+  assert.deepEqual(diff.toUnsubscribe, ["0:old"]);
+});

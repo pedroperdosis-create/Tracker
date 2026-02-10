@@ -8,11 +8,13 @@ export const splitIntoBatches = <T>(items: T[], size: number): T[][] => {
 };
 
 export const diffAccountSubscriptions = (dbAccountIds: string[], remoteAccountIds: string[]) => {
-  const dbSet = new Set(dbAccountIds);
-  const remoteSet = new Set(remoteAccountIds);
+  const dbDistinct = Array.from(new Set(dbAccountIds));
+  const remoteDistinct = Array.from(new Set(remoteAccountIds));
+  const dbSet = new Set(dbDistinct);
+  const remoteSet = new Set(remoteDistinct);
 
-  const toSubscribe = dbAccountIds.filter((accountId) => !remoteSet.has(accountId));
-  const toUnsubscribe = remoteAccountIds.filter((accountId) => !dbSet.has(accountId));
+  const toSubscribe = dbDistinct.filter((accountId) => !remoteSet.has(accountId));
+  const toUnsubscribe = remoteDistinct.filter((accountId) => !dbSet.has(accountId));
 
   return { toSubscribe, toUnsubscribe };
 };
