@@ -1,3 +1,5 @@
+import type { TonApiAction } from "./swap";
+
 type LimiterOptions = {
   rps: number;
   burst: number;
@@ -167,10 +169,10 @@ const toAddress = (value: TonApiTxMessage["source"] | TonApiTxMessage["destinati
   return value.address;
 };
 
-export const buildTonTransferActionsFromTransaction = (accountId: string, tx: TonApiTransaction) => {
+export const buildTonTransferActionsFromTransaction = (accountId: string, tx: TonApiTransaction): TonApiAction[] => {
   const messages = [tx.in_msg, ...(tx.out_msgs ?? [])].filter((item): item is TonApiTxMessage => Boolean(item));
   return messages
-    .map((message) => {
+    .map((message): TonApiAction | null => {
       const sender = toAddress(message.source);
       const recipient = toAddress(message.destination);
       const amount = message.value ?? "0";
@@ -185,5 +187,5 @@ export const buildTonTransferActionsFromTransaction = (accountId: string, tx: To
         }
       };
     })
-    .filter((item): item is { type: "TonTransfer"; status: "ok"; TonTransfer: NonNullable<unknown> } => Boolean(item));
+    .filter((item): item is TonApiAction => item !== null);
 };
