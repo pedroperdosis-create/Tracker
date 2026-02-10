@@ -1059,9 +1059,21 @@ const syncWebhookSubscriptions = async (webhookId: string) => {
   let subscribedCount = 0;
   let unsubscribedCount = 0;
   let errorsCount = 0;
+  let toRemoveCount = 0;
   try {
     const remoteAccountIds = await listRemoteSubscriptions(webhookId);
     const { toSubscribe, toUnsubscribe } = diffAccountSubscriptions(dbAccountIds, remoteAccountIds);
+    toRemoveCount = toUnsubscribe.length;
+
+    logger.debug(
+      {
+        dbCount: dbAccountIds.length,
+        remoteCount: remoteAccountIds.length,
+        toAddCount: toSubscribe.length,
+        toRemoveCount
+      },
+      "webhook sync diff"
+    );
 
     for (const batch of splitIntoBatches(toSubscribe, WEBHOOK_SYNC_BATCH)) {
       if (batch.length === 0) continue;
@@ -1086,6 +1098,11 @@ const syncWebhookSubscriptions = async (webhookId: string) => {
         body: JSON.stringify({ accounts: batch })
       });
       if (!response.ok) {
+        if (response.status === 404 || response.status === 409) {
+          unsubscribedCount += batch.length;
+          logger.info({ status: response.status, batch: batch.length }, "webhook unsubscribe batch already absent");
+          continue;
+        }
         errorsCount += batch.length;
         logger.warn({ status: response.status, batch: batch.length }, "webhook unsubscribe batch failed");
       } else {
@@ -1101,6 +1118,7 @@ const syncWebhookSubscriptions = async (webhookId: string) => {
     {
       subscribedCount,
       unsubscribedCount,
+      toRemoveCount,
       errorsCount,
       durationMs: Date.now() - startedAt
     },
@@ -1365,7 +1383,7 @@ async function start() {
     let normalizedCount = 0;
     let result: ProcessWalletResult = { newCount: 0, notifiedCount: 0 };
     const fastStart = Date.now();
-    if (hint.txHash) {
+    if (FAST_MODE && hint.txHash) {
       try {
         const fast = await processWebhookFastPath({ wallet, notifierUser, lang, accountId, txHash: hint.txHash });
         normalizedCount = fast.normalizedCount;
