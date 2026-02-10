@@ -15,7 +15,12 @@ import {
 } from "./swap";
 import { createEmptyProcessResult } from "./process-result";
 import type { ProcessWalletResult } from "./process-result";
-import { TonApiError, TonApiLimiter } from "./tonapi";
+import {
+  TonApiError,
+  TonApiLimiter,
+  buildTonTransferActionsFromTransaction,
+  fetchTonApiTransaction
+} from "./tonapi";
 import { prisma } from "./prisma";
 import { createDebouncedInFlightQueue } from "./ws-queue";
 import {
@@ -897,6 +902,35 @@ const fetchWebhookEvents = async (accountId: string, lt?: string, txHash?: strin
   );
 };
 
+const processWebhookFastPath = async (params: {
+  wallet: ProcessWalletInput;
+  notifierUser: NotifierUser;
+  lang: Language;
+  accountId: string;
+  txHash: string;
+}): Promise<{ ok: boolean; normalizedCount: number; result: ProcessWalletResult }> => {
+  const tx = await fetchTonApiTransaction({
+    tonapiBase: TONAPI_BASE,
+    tonapiKey: TONAPI_KEY,
+    txHash: params.txHash,
+    limiter: tonapiLimiter
+  });
+  const actions = buildTonTransferActionsFromTransaction(params.accountId, tx);
+  const eventLt = tx.lt ? String(tx.lt) : "0";
+  if (actions.length === 0) {
+    return { ok: true, normalizedCount: 0, result: createEmptyProcessResult() };
+  }
+  const event: TonApiEvent = {
+    event_id: tx.hash ?? params.txHash,
+    lt: eventLt,
+    transaction: { lt: eventLt },
+    base_transactions: [params.txHash],
+    actions
+  };
+  const result = await processEventsForWallet(params.wallet, [event], params.notifierUser, params.lang, "webhook");
+  return { ok: true, normalizedCount: actions.length, result };
+};
+
 const extractWebhookLt = (payload: WebhookPayload): string | undefined => {
   const directLt = payload.lt;
   if (typeof directLt === "string") return directLt;
@@ -1326,15 +1360,47 @@ async function start() {
     const user = await prisma.user.findUnique({ where: { id: wallet.userId } });
     if (!user) return;
     const lang = (user.language as Language) ?? DEFAULT_LANGUAGE;
-    let events: TonApiEvent[] = [];
-    try {
-      events = await fetchWebhookEvents(accountId, extractWebhookLt(payload), hint.txHash);
-    } catch (error) {
-      logger.warn({ error, accountId }, "webhook fetch failed");
-      return;
-    }
     const notifierUser = userToNotifierUser(user);
-    const result = await processEventsForWallet(wallet, events, notifierUser, lang, "webhook");
+    let fallbackUsed = false;
+    let normalizedCount = 0;
+    let result: ProcessWalletResult = { newCount: 0, notifiedCount: 0 };
+    const fastStart = Date.now();
+    if (hint.txHash) {
+      try {
+        const fast = await processWebhookFastPath({ wallet, notifierUser, lang, accountId, txHash: hint.txHash });
+        normalizedCount = fast.normalizedCount;
+        result = fast.result;
+      } catch (error) {
+        fallbackUsed = true;
+        logger.warn({ error, txHash: hint.txHash, accountId }, "webhook fast-path failed, fallback");
+      }
+    } else {
+      fallbackUsed = true;
+    }
+
+    if (fallbackUsed) {
+      let events: TonApiEvent[] = [];
+      try {
+        events = await fetchWebhookEvents(accountId, extractWebhookLt(payload), hint.txHash);
+      } catch (error) {
+        logger.warn({ error, accountId }, "webhook fetch failed");
+        return;
+      }
+      result = await processEventsForWallet(wallet, events, notifierUser, lang, "webhook");
+      normalizedCount = events.reduce((sum, event) => sum + (event.actions?.length ?? 0), 0);
+    }
+
+    logger.info(
+      {
+        txHash: hint.txHash ?? null,
+        ok: !fallbackUsed,
+        durationMs: Date.now() - fastStart,
+        normalizedCount,
+        fallbackUsed
+      },
+      "webhook fast-path"
+    );
+
     logger.info(
       {
         accountId,

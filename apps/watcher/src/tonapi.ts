@@ -127,3 +127,63 @@ export class TonApiError extends Error {
     this.status = status;
   }
 }
+
+export type TonApiTxMessage = {
+  source?: { address?: string } | string;
+  destination?: { address?: string } | string;
+  value?: string;
+};
+
+export type TonApiTransaction = {
+  hash?: string;
+  lt?: string;
+  in_msg?: TonApiTxMessage | null;
+  out_msgs?: TonApiTxMessage[];
+};
+
+export const fetchTonApiTransaction = async (params: {
+  tonapiBase: string;
+  tonapiKey?: string;
+  txHash: string;
+  limiter: TonApiLimiter;
+}): Promise<TonApiTransaction> => {
+  const url = new URL(`${params.tonapiBase}/blockchain/transactions/${params.txHash}`);
+  const headers: Record<string, string> = { Accept: "application/json" };
+  if (params.tonapiKey) {
+    headers.Authorization = `Bearer ${params.tonapiKey}`;
+  }
+  const response = await params.limiter.schedule(() => fetch(url, { headers }));
+  if (!response.ok) {
+    params.limiter.markResponse(response.status);
+    throw new TonApiError(response.status, `TonAPI tx error ${response.status}`);
+  }
+  params.limiter.markResponse(response.status);
+  return (await response.json()) as TonApiTransaction;
+};
+
+const toAddress = (value: TonApiTxMessage["source"] | TonApiTxMessage["destination"]) => {
+  if (!value) return undefined;
+  if (typeof value === "string") return value;
+  return value.address;
+};
+
+export const buildTonTransferActionsFromTransaction = (accountId: string, tx: TonApiTransaction) => {
+  const messages = [tx.in_msg, ...(tx.out_msgs ?? [])].filter((item): item is TonApiTxMessage => Boolean(item));
+  return messages
+    .map((message) => {
+      const sender = toAddress(message.source);
+      const recipient = toAddress(message.destination);
+      const amount = message.value ?? "0";
+      if (sender !== accountId && recipient !== accountId) return null;
+      return {
+        type: "TonTransfer",
+        status: "ok",
+        TonTransfer: {
+          amount,
+          sender: sender ? { address: sender } : undefined,
+          recipient: recipient ? { address: recipient } : undefined
+        }
+      };
+    })
+    .filter((item): item is { type: "TonTransfer"; status: "ok"; TonTransfer: NonNullable<unknown> } => Boolean(item));
+};
