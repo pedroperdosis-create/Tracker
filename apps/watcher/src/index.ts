@@ -180,7 +180,6 @@ const buildWalletEventDedupeKey = (params: {
   direction: NormalizedAction["direction"];
   asset: string;
   amount?: string;
-  counterparty?: string;
 }) =>
   [
     params.walletId,
@@ -189,8 +188,7 @@ const buildWalletEventDedupeKey = (params: {
     params.type,
     params.direction,
     params.asset,
-    params.amount ?? "",
-    params.counterparty ?? ""
+    params.amount ?? ""
   ].join(":");
 
 const hasMaestroNote = (action: TonApiAction) => {
@@ -506,8 +504,7 @@ const processEventsForWallet = async (
         type: action.type,
         direction: action.direction,
         asset: action.asset,
-        amount: action.amount ?? undefined,
-        counterparty: action.counterparty?.address ?? action.counterparty?.name ?? undefined
+        amount: action.amount ?? undefined
       });
       try {
         await prisma.walletEvent.create({
@@ -729,8 +726,7 @@ async function processWallet(wallet: ProcessWalletInput): Promise<ProcessWalletR
         type: action.type,
         direction: action.direction,
         asset: action.asset,
-        amount: action.amount ?? undefined,
-        counterparty: action.counterparty?.address ?? action.counterparty?.name ?? undefined
+        amount: action.amount ?? undefined
       });
       try {
         await prisma.walletEvent.create({
