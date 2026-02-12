@@ -172,6 +172,27 @@ const normalizeStoredCursor = (value?: string | null): bigint | null => {
   }
 };
 
+const buildWalletEventDedupeKey = (params: {
+  walletId: string;
+  txHash: string;
+  lt: string;
+  type: NormalizedAction["type"];
+  direction: NormalizedAction["direction"];
+  asset: string;
+  amount?: string;
+  counterparty?: string;
+}) =>
+  [
+    params.walletId,
+    params.txHash,
+    params.lt,
+    params.type,
+    params.direction,
+    params.asset,
+    params.amount ?? "",
+    params.counterparty ?? ""
+  ].join(":");
+
 const hasMaestroNote = (action: TonApiAction) => {
   const preview = `${action.simple_preview?.name ?? ""} ${action.simple_preview?.description ?? ""}`.toLowerCase();
   return preview.includes("maestro");
@@ -431,6 +452,7 @@ const processEventsForWallet = async (
   let normalizedCountTotal = 0;
   let insertedCount = 0;
   let insertErrorsCount = 0;
+  let duplicateSkippedCount = 0;
   let notifiedCount = 0;
 
   for (const event of sorted) {
@@ -477,11 +499,22 @@ const processEventsForWallet = async (
     const createdActions: NormalizedAction[] = [];
     for (const action of normalized) {
       const txHash = action.type === "JETTON" ? event.event_id : tonTxHash;
+      const dedupeKey = buildWalletEventDedupeKey({
+        walletId: wallet.id,
+        txHash,
+        lt: eventLtRaw,
+        type: action.type,
+        direction: action.direction,
+        asset: action.asset,
+        amount: action.amount ?? undefined,
+        counterparty: action.counterparty?.address ?? action.counterparty?.name ?? undefined
+      });
       try {
         await prisma.walletEvent.create({
           data: {
             walletId: wallet.id,
             txHash,
+            dedupeKey,
             actionId: action.actionId,
             type: action.type,
             direction: action.direction,
@@ -528,6 +561,7 @@ const processEventsForWallet = async (
         }
       } catch (error) {
         if (isUniqueViolation(error)) {
+          duplicateSkippedCount += 1;
           continue;
         }
         const err = normalizeError(error);
@@ -576,6 +610,7 @@ const processEventsForWallet = async (
       normalizedCountTotal,
       insertedCount,
       insertErrorsCount,
+      duplicateSkippedCount,
       notifiedCount,
       cursorAfter: maxCursor.toString()
     },
@@ -640,6 +675,7 @@ async function processWallet(wallet: ProcessWalletInput): Promise<ProcessWalletR
   let normalizedCountTotal = 0;
   let insertedCount = 0;
   let insertErrorsCount = 0;
+  let duplicateSkippedCount = 0;
   let notifiedCount = 0;
 
   for (const event of sorted) {
@@ -686,11 +722,22 @@ async function processWallet(wallet: ProcessWalletInput): Promise<ProcessWalletR
     const createdActions: NormalizedAction[] = [];
     for (const action of normalized) {
       const txHash = action.type === "JETTON" ? event.event_id : tonTxHash;
+      const dedupeKey = buildWalletEventDedupeKey({
+        walletId: wallet.id,
+        txHash,
+        lt: eventLtRaw,
+        type: action.type,
+        direction: action.direction,
+        asset: action.asset,
+        amount: action.amount ?? undefined,
+        counterparty: action.counterparty?.address ?? action.counterparty?.name ?? undefined
+      });
       try {
         await prisma.walletEvent.create({
           data: {
             walletId: wallet.id,
             txHash,
+            dedupeKey,
             actionId: action.actionId,
             type: action.type,
             direction: action.direction,
@@ -737,6 +784,7 @@ async function processWallet(wallet: ProcessWalletInput): Promise<ProcessWalletR
         }
       } catch (error) {
         if (isUniqueViolation(error)) {
+          duplicateSkippedCount += 1;
           continue;
         }
         const err = normalizeError(error);
@@ -788,6 +836,7 @@ async function processWallet(wallet: ProcessWalletInput): Promise<ProcessWalletR
       normalizedCountTotal,
       insertedCount,
       insertErrorsCount,
+      duplicateSkippedCount,
       notifiedCount,
       cursorAfter: maxCursor.toString()
     },

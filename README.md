@@ -72,3 +72,18 @@ docker compose logs -f bot
 ## Ссылки
 - Адреса: `https://tonviewer.com/<address>`
 - Транзакции: `https://tonviewer.com/transaction/<hash>`
+
+## Проверка дедупликации WalletEvent/уведомлений
+1. Добавьте тестовый кошелёк `UQBk0yI9-G5uCIPlxvZzQAQAFBqIo3dBCb2zyvVanIiCGjXP`.
+2. Выполните одну входящую или исходящую транзакцию.
+3. Проверьте, что в Telegram пришло ровно одно уведомление по этому событию.
+4. Проверьте БД: для одного `walletId` и детерминированного `dedupeKey` должна быть только одна запись.
+   Пример проверки:
+   ```sql
+   SELECT "walletId", "txHash", "dedupeKey", COUNT(*)
+   FROM "WalletEvent"
+   WHERE "walletId" = '<walletId>'
+   GROUP BY 1,2,3
+   HAVING COUNT(*) > 1;
+   ```
+   Запрос должен вернуть 0 строк.

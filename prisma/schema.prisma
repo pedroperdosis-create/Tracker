@@ -71,6 +71,7 @@ model WalletEvent {
   asset        String
   amount       String?
   counterparty String?
+  dedupeKey    String?        @unique
   metadata     Json?
   createdAt    DateTime       @default(now())
   wallet       Wallet         @relation(fields: [walletId], references: [id], onDelete: Cascade)
