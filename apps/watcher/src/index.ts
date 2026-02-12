@@ -160,6 +160,8 @@ const extractEventLt = (event: TonApiEvent): string | null => {
   }
 };
 
+const buildCursor = (lt: string, actionIndex: number) => BigInt(lt) * 1000n + BigInt(actionIndex);
+
 const hasMaestroNote = (action: TonApiAction) => {
   const preview = `${action.simple_preview?.name ?? ""} ${action.simple_preview?.description ?? ""}`.toLowerCase();
   return preview.includes("maestro");
@@ -386,11 +388,11 @@ const processEventsForWallet = async (
   const actionsCount = events.reduce((sum, event) => sum + (event.actions?.length ?? 0), 0);
   const sampleEvent = events[0];
   const sampleLt = sampleEvent ? extractEventLt(sampleEvent) : null;
-  const maxFetchedLt = events.reduce((max, event) => {
+  const maxFetchedCursor = events.reduce((max, event) => {
     const lt = extractEventLt(event);
     if (!lt) return max;
-    const value = BigInt(lt);
-    return value > max ? value : max;
+    const cursor = buildCursor(lt, Math.max(0, (event.actions?.length ?? 1) - 1));
+    return cursor > max ? cursor : max;
   }, 0n);
   logger.info(
     {
@@ -399,7 +401,7 @@ const processEventsForWallet = async (
       events: events.length,
       actions: actionsCount,
       sample: sampleEvent ? { txHash: sampleEvent.event_id, lt: sampleLt } : null,
-      maxFetchedLt: maxFetchedLt ? maxFetchedLt.toString() : null,
+      maxFetchedCursor: maxFetchedCursor ? maxFetchedCursor.toString() : null,
       source
     },
     "tonapi events fetched"
@@ -414,7 +416,7 @@ const processEventsForWallet = async (
     if (!aLt || !bLt) return 0;
     return Number(BigInt(aLt) - BigInt(bLt));
   });
-  let maxLt = cursorBefore ?? 0n;
+  let maxCursor = cursorBefore ?? 0n;
   let newCount = 0;
   let normalizedCountTotal = 0;
   let insertedCount = 0;
@@ -427,8 +429,8 @@ const processEventsForWallet = async (
       logger.warn({ txHash: event.event_id }, "missing or invalid lt in event");
       continue;
     }
-    const eventLt = BigInt(eventLtRaw);
-    if (cursorBefore !== null && eventLt <= cursorBefore) {
+    const eventCursor = buildCursor(eventLtRaw, Math.max(0, event.actions.length - 1));
+    if (cursorBefore !== null && eventCursor <= cursorBefore) {
       continue;
     }
     newCount += 1;
@@ -459,7 +461,7 @@ const processEventsForWallet = async (
         { txHash: event.event_id, lt: eventLtRaw, actionTypes },
         "no normalized actions for event"
       );
-      maxLt = eventLt > maxLt ? eventLt : maxLt;
+      maxCursor = eventCursor > maxCursor ? eventCursor : maxCursor;
       continue;
     }
     const createdActions: NormalizedAction[] = [];
@@ -552,26 +554,26 @@ const processEventsForWallet = async (
       }
     }
 
-    maxLt = eventLt > maxLt ? eventLt : maxLt;
+    maxCursor = eventCursor > maxCursor ? eventCursor : maxCursor;
   }
 
   logger.info(
     {
       walletId: wallet.id,
       cursorBefore: cursorBefore?.toString() ?? null,
-      maxFetchedLt: maxFetchedLt ? maxFetchedLt.toString() : null,
+      maxFetchedCursor: maxFetchedCursor ? maxFetchedCursor.toString() : null,
       newCount,
       normalizedCountTotal,
       insertedCount,
       insertErrorsCount,
       notifiedCount,
-      cursorAfter: maxLt.toString()
+      cursorAfter: maxCursor.toString()
     },
     "wallet processing summary"
   );
 
   if (cursorBefore === null ? newCount > 0 : normalizedCountTotal > 0 && insertedCount > 0) {
-    await prisma.wallet.update({ where: { id: wallet.id }, data: { lastEventLt: maxLt.toString() } });
+    await prisma.wallet.update({ where: { id: wallet.id }, data: { lastEventLt: maxCursor.toString() } });
   }
   return { newCount, notifiedCount };
 };
@@ -596,11 +598,11 @@ async function processWallet(wallet: ProcessWalletInput): Promise<ProcessWalletR
   const actionsCount = events.reduce((sum, event) => sum + (event.actions?.length ?? 0), 0);
   const sampleEvent = events[0];
   const sampleLt = sampleEvent ? extractEventLt(sampleEvent) : null;
-  const maxFetchedLt = events.reduce((max, event) => {
+  const maxFetchedCursor = events.reduce((max, event) => {
     const lt = extractEventLt(event);
     if (!lt) return max;
-    const value = BigInt(lt);
-    return value > max ? value : max;
+    const cursor = buildCursor(lt, Math.max(0, (event.actions?.length ?? 1) - 1));
+    return cursor > max ? cursor : max;
   }, 0n);
   logger.info(
     {
@@ -609,7 +611,7 @@ async function processWallet(wallet: ProcessWalletInput): Promise<ProcessWalletR
       events: events.length,
       actions: actionsCount,
       sample: sampleEvent ? { txHash: sampleEvent.event_id, lt: sampleLt } : null,
-      maxFetchedLt: maxFetchedLt ? maxFetchedLt.toString() : null
+      maxFetchedCursor: maxFetchedCursor ? maxFetchedCursor.toString() : null
     },
     "tonapi events fetched"
   );
@@ -623,7 +625,7 @@ async function processWallet(wallet: ProcessWalletInput): Promise<ProcessWalletR
     if (!aLt || !bLt) return 0;
     return Number(BigInt(aLt) - BigInt(bLt));
   });
-  let maxLt = cursorBefore ?? 0n;
+  let maxCursor = cursorBefore ?? 0n;
   let newCount = 0;
   let normalizedCountTotal = 0;
   let insertedCount = 0;
@@ -636,8 +638,8 @@ async function processWallet(wallet: ProcessWalletInput): Promise<ProcessWalletR
       logger.warn({ txHash: event.event_id }, "missing or invalid lt in event");
       continue;
     }
-    const eventLt = BigInt(eventLtRaw);
-    if (cursorBefore !== null && eventLt <= cursorBefore) {
+    const eventCursor = buildCursor(eventLtRaw, Math.max(0, event.actions.length - 1));
+    if (cursorBefore !== null && eventCursor <= cursorBefore) {
       continue;
     }
     newCount += 1;
@@ -668,7 +670,7 @@ async function processWallet(wallet: ProcessWalletInput): Promise<ProcessWalletR
         { txHash: event.event_id, lt: eventLtRaw, actionTypes },
         "no normalized actions for event"
       );
-      maxLt = eventLt > maxLt ? eventLt : maxLt;
+      maxCursor = eventCursor > maxCursor ? eventCursor : maxCursor;
       continue;
     }
     const createdActions: NormalizedAction[] = [];
@@ -764,26 +766,26 @@ async function processWallet(wallet: ProcessWalletInput): Promise<ProcessWalletR
       }
     }
 
-    maxLt = eventLt > maxLt ? eventLt : maxLt;
+    maxCursor = eventCursor > maxCursor ? eventCursor : maxCursor;
   }
 
   logger.info(
     {
       walletId: wallet.id,
       cursorBefore: cursorBefore?.toString() ?? null,
-      maxFetchedLt: maxFetchedLt ? maxFetchedLt.toString() : null,
+      maxFetchedCursor: maxFetchedCursor ? maxFetchedCursor.toString() : null,
       newCount,
       normalizedCountTotal,
       insertedCount,
       insertErrorsCount,
       notifiedCount,
-      cursorAfter: maxLt.toString()
+      cursorAfter: maxCursor.toString()
     },
     "wallet processing summary"
   );
 
   if (cursorBefore === null ? newCount > 0 : normalizedCountTotal > 0 && insertedCount > 0) {
-    await prisma.wallet.update({ where: { id: wallet.id }, data: { lastEventLt: maxLt.toString() } });
+    await prisma.wallet.update({ where: { id: wallet.id }, data: { lastEventLt: maxCursor.toString() } });
   }
   return { newCount, notifiedCount };
 }
