@@ -162,6 +162,16 @@ const extractEventLt = (event: TonApiEvent): string | null => {
 
 const buildCursor = (lt: string, actionIndex: number) => BigInt(lt) * 1000n + BigInt(actionIndex);
 
+const normalizeStoredCursor = (value?: string | null): bigint | null => {
+  if (!value) return null;
+  try {
+    const cursor = BigInt(value);
+    return cursor < 1_000_000_000_000_000n ? cursor * 1000n : cursor;
+  } catch {
+    return null;
+  }
+};
+
 const hasMaestroNote = (action: TonApiAction) => {
   const preview = `${action.simple_preview?.name ?? ""} ${action.simple_preview?.description ?? ""}`.toLowerCase();
   return preview.includes("maestro");
@@ -409,7 +419,7 @@ const processEventsForWallet = async (
 
   if (events.length === 0) return createEmptyProcessResult();
 
-  const cursorBefore = wallet.lastEventLt ? BigInt(wallet.lastEventLt) : null;
+  const cursorBefore = normalizeStoredCursor(wallet.lastEventLt);
   const sorted = events.sort((a, b) => {
     const aLt = extractEventLt(a);
     const bLt = extractEventLt(b);
@@ -586,7 +596,7 @@ async function processWallet(wallet: ProcessWalletInput): Promise<ProcessWalletR
 
   let events: TonApiEvent[] = [];
   try {
-    events = await fetchEvents(wallet.address, wallet.lastEventLt ?? undefined);
+    events = await fetchEvents(wallet.address);
   } catch (error) {
     logger.warn({ error, wallet: wallet.id }, "failed to fetch events");
     if (error instanceof TonApiError) {
@@ -618,7 +628,7 @@ async function processWallet(wallet: ProcessWalletInput): Promise<ProcessWalletR
 
   if (events.length === 0) return createEmptyProcessResult();
 
-  const cursorBefore = wallet.lastEventLt ? BigInt(wallet.lastEventLt) : null;
+  const cursorBefore = normalizeStoredCursor(wallet.lastEventLt);
   const sorted = events.sort((a, b) => {
     const aLt = extractEventLt(a);
     const bLt = extractEventLt(b);
