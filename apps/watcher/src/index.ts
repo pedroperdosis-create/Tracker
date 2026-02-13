@@ -304,11 +304,14 @@ const normalizeActions = (
     });
 };
 
-const formatTonAddressForDisplay = (address?: string) => {
+const formatTonAddressForDisplay = (address?: string): string | undefined => {
   if (!address) return address;
-  const rawPattern = /^-?\d+:[0-9a-fA-F]{64}$/;
+  const rawPattern = /^(-?\d+):([0-9a-fA-F]{64})$/;
   try {
-    const parsed = rawPattern.test(address) ? Address.parseRaw(address) : Address.parse(address);
+    const match = address.match(rawPattern);
+    const parsed = match
+      ? new Address(Number(match[1]), Buffer.from(match[2], "hex"))
+      : Address.parse(address);
     return parsed.toString({ urlSafe: true, bounceable: true, testOnly: false });
   } catch {
     return address;
@@ -464,6 +467,7 @@ const processEventsForWallet = async (
   let insertErrorsCount = 0;
   let duplicateSkippedCount = 0;
   let notifiedCount = 0;
+  const seenDedupeKeys = new Set<string>();
 
   for (const event of sorted) {
     const eventLtRaw = extractEventLt(event);
@@ -507,7 +511,6 @@ const processEventsForWallet = async (
       continue;
     }
     const createdActions: NormalizedAction[] = [];
-    const seenDedupeKeys = new Set<string>();
     for (const action of normalized) {
       const txHash = action.type === "JETTON" ? event.event_id : tonTxHash;
       const dedupeKey = buildWalletEventDedupeKey({
@@ -692,6 +695,7 @@ async function processWallet(wallet: ProcessWalletInput): Promise<ProcessWalletR
   let insertErrorsCount = 0;
   let duplicateSkippedCount = 0;
   let notifiedCount = 0;
+  const seenDedupeKeys = new Set<string>();
 
   for (const event of sorted) {
     const eventLtRaw = extractEventLt(event);
@@ -735,7 +739,6 @@ async function processWallet(wallet: ProcessWalletInput): Promise<ProcessWalletR
       continue;
     }
     const createdActions: NormalizedAction[] = [];
-    const seenDedupeKeys = new Set<string>();
     for (const action of normalized) {
       const txHash = action.type === "JETTON" ? event.event_id : tonTxHash;
       const dedupeKey = buildWalletEventDedupeKey({
