@@ -304,12 +304,22 @@ const normalizeActions = (
     });
 };
 
+const formatTonAddressForDisplay = (address?: string) => {
+  if (!address) return address;
+  try {
+    return Address.parse(address).toString({ urlSafe: true, bounceable: true, testOnly: false });
+  } catch {
+    return address;
+  }
+};
+
 const formatCounterparty = (value: { address?: string; name?: string } | undefined, lang: Language) => {
   if (!value) return t(lang, "unknown");
   const label = value.name ?? value.address ?? t(lang, "unknown");
   if (value.address) {
-    const display = value.name ?? shortAddress(value.address);
-    return `<a href=\"${addressLink(value.address)}\">${display}</a>`;
+    const displayAddress = formatTonAddressForDisplay(value.address);
+    const display = value.name ?? shortAddress(displayAddress);
+    return `<a href=\"${addressLink(displayAddress)}\">${display}</a>`;
   }
   return label;
 };
