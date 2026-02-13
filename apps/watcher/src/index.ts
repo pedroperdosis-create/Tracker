@@ -306,8 +306,10 @@ const normalizeActions = (
 
 const formatTonAddressForDisplay = (address?: string) => {
   if (!address) return address;
+  const rawPattern = /^-?\d+:[0-9a-fA-F]{64}$/;
   try {
-    return Address.parse(address).toString({ urlSafe: true, bounceable: true, testOnly: false });
+    const parsed = rawPattern.test(address) ? Address.parseRaw(address) : Address.parse(address);
+    return parsed.toString({ urlSafe: true, bounceable: true, testOnly: false });
   } catch {
     return address;
   }
@@ -505,6 +507,7 @@ const processEventsForWallet = async (
       continue;
     }
     const createdActions: NormalizedAction[] = [];
+    const seenDedupeKeys = new Set<string>();
     for (const action of normalized) {
       const txHash = action.type === "JETTON" ? event.event_id : tonTxHash;
       const dedupeKey = buildWalletEventDedupeKey({
@@ -516,6 +519,11 @@ const processEventsForWallet = async (
         asset: action.asset,
         amount: action.amount ?? undefined
       });
+      if (seenDedupeKeys.has(dedupeKey)) {
+        duplicateSkippedCount += 1;
+        continue;
+      }
+      seenDedupeKeys.add(dedupeKey);
       try {
         await prisma.walletEvent.create({
           data: {
@@ -727,6 +735,7 @@ async function processWallet(wallet: ProcessWalletInput): Promise<ProcessWalletR
       continue;
     }
     const createdActions: NormalizedAction[] = [];
+    const seenDedupeKeys = new Set<string>();
     for (const action of normalized) {
       const txHash = action.type === "JETTON" ? event.event_id : tonTxHash;
       const dedupeKey = buildWalletEventDedupeKey({
@@ -738,6 +747,11 @@ async function processWallet(wallet: ProcessWalletInput): Promise<ProcessWalletR
         asset: action.asset,
         amount: action.amount ?? undefined
       });
+      if (seenDedupeKeys.has(dedupeKey)) {
+        duplicateSkippedCount += 1;
+        continue;
+      }
+      seenDedupeKeys.add(dedupeKey);
       try {
         await prisma.walletEvent.create({
           data: {
