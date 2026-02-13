@@ -1,0 +1,81 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserStep {
+  NONE
+  ADD_ADDRESS
+  ADD_NAME
+  EDIT_RENAME
+  EDIT_CHANGE_ADDRESS
+}
+
+enum EventDirection {
+  IN
+  OUT
+}
+
+enum EventType {
+  TON
+  JETTON
+  NFT
+}
+
+model User {
+  id         String     @id @default(cuid())
+  telegramId BigInt     @unique
+  username   String?
+  firstName  String?
+  lastName   String?
+  language   String     @default("ru")
+  createdAt  DateTime   @default(now())
+  wallets    Wallet[]
+  state      UserState?
+}
+
+model Wallet {
+  id           String        @id @default(cuid())
+  userId       String
+  name         String
+  address      String
+  lastEventLt  String?
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  events       WalletEvent[]
+
+  @@index([userId])
+}
+
+model UserState {
+  id           String   @id @default(cuid())
+  userId       String   @unique
+  step         UserStep @default(NONE)
+  tempAddress  String?
+  tempWalletId String?
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model WalletEvent {
+  id           String         @id @default(cuid())
+  walletId     String
+  txHash       String
+  actionId     String
+  type         EventType
+  direction    EventDirection
+  asset        String
+  amount       String?
+  counterparty String?
+  dedupeKey    String?        @unique
+  metadata     Json?
+  createdAt    DateTime       @default(now())
+  wallet       Wallet         @relation(fields: [walletId], references: [id], onDelete: Cascade)
+
+  @@unique([walletId, txHash, actionId])
+  @@index([walletId])
+}
